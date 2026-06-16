@@ -12,12 +12,17 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 // dedup helpers
 
@@ -486,7 +491,49 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    if (!self_ema_kv_idxs) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
+
+    if (self_ema_kv_idxs) {
+        GGML_ASSERT(self_ema_kq_mask);
+        GGML_ASSERT(cparams.ema_kv_select);
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_ema_kv_idxs->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_ema_kq_mask->buffer));
+
+        const int64_t n_keep   = self_ema_kv_idxs->ne[0];
+        const int64_t n_tps    = self_ema_kv_idxs->ne[1];
+        const int64_t n_stream = self_ema_kv_idxs->ne[2];
+
+        GGML_ASSERT((int64_t) ubatch->n_tokens == n_tps*n_stream);
+        GGML_ASSERT(self_ema_kq_mask->ne[0] == n_keep);
+        GGML_ASSERT(self_ema_kq_mask->ne[1] == n_tps);
+        GGML_ASSERT(self_ema_kq_mask->ne[3] == n_stream);
+
+        int32_t * idxs = (int32_t *) self_ema_kv_idxs->data;
+        float * mask = (float *) self_ema_kq_mask->data;
+        std::fill(mask, mask + ggml_nelements(self_ema_kq_mask), -INFINITY);
+
+        std::vector<int32_t> selected(n_keep, 0);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t t = 0; t < n_tps; ++t) {
+                const int64_t i = s*n_tps + t;
+                const int32_t seq_id = ubatch->seq_id[i][0];
+                const int32_t pos = ubatch->pos[i];
+
+                int32_t n_selected = cparams.ema_kv_select(
+                        cparams.ema_kv_select_user_data,
+                        layer, seq_id, pos, (int32_t) n_keep, selected.data());
+                n_selected = std::max(0, std::min<int32_t>(n_selected, n_keep));
+
+                for (int64_t k = 0; k < n_keep; ++k) {
+                    const int64_t off = k + n_keep*(t + n_tps*s);
+                    idxs[off] = k < n_selected ? selected[k] : 0;
+                    mask[off] = k < n_selected ? 0.0f : -INFINITY;
+                }
+            }
+        }
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -508,8 +555,32 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= (cparams.ema_kv_active == params.cparams.ema_kv_active);
+    res &= (cparams.ema_kv_keep   == params.cparams.ema_kv_keep);
+    if (params.cparams.ema_kv_active) {
+        const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+        const int64_t n_tps = params.ubatch.n_tokens/n_stream;
+        if (n_tps == 1) {
+            res &= self_ema_kv_idxs && self_ema_kv_idxs->ne[0] == params.cparams.ema_kv_keep;
+            res &= self_ema_kv_idxs && self_ema_kv_idxs->ne[1] == n_tps;
+            res &= self_ema_kv_idxs && self_ema_kv_idxs->ne[2] == n_stream;
+        } else {
+            res &= self_ema_kv_idxs == nullptr;
+            res &= self_ema_kq_mask == nullptr;
+        }
+    }
 
     return res;
+}
+
+bool llm_graph_input_stream_kv::can_reuse(const llm_graph_params & params) {
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+    return params.cparams.stream_kv_enabled &&
+           params.cparams.stream_kv_active &&
+           params.ubatch.n_tokens == n_stream &&
+           (int64_t) n_visible.size() == n_stream &&
+           params.cparams.stream_kv_sink == sink &&
+           params.cparams.stream_kv_recent == recent;
 }
 
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
@@ -1893,6 +1964,25 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_inp_hidden() const {
+    const int64_t n_embd = hparams.n_embd;
+
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+
+    ggml_tensor * cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, ubatch.n_tokens);
+    cb(cur, "inp_hidden", -1);
+    ggml_set_input(cur);
+
+    inp->embd = cur;
+
+    res->t_inp_embd = cur;
+    res->add_input(std::move(inp));
+
+    ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_inp_pos() const {
     auto inp = std::make_unique<llm_graph_input_pos>(hparams.n_pos_per_embd());
 
@@ -2254,9 +2344,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    int32_t layer) {
 
-    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur, layer);
 
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
@@ -2266,6 +2357,28 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
+
+        if (cparams.ema_kv_active) {
+            const auto n_tokens = ubatch.n_tokens;
+            const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+            GGML_ASSERT(n_stream > 0);
+            GGML_ASSERT(n_tokens % n_stream == 0);
+            GGML_ASSERT(cparams.ema_kv_keep > 0);
+            GGML_ASSERT(cparams.ema_kv_select != nullptr);
+            const auto n_tps = n_tokens/n_stream;
+
+            if (n_tps == 1) {
+                inp->self_ema_kv_idxs = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32,
+                        cparams.ema_kv_keep, n_tps, n_stream);
+                ggml_set_input(inp->self_ema_kv_idxs);
+                ggml_set_name(inp->self_ema_kv_idxs, "attn_inp_ema_kv_idxs");
+
+                inp->self_ema_kq_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                        cparams.ema_kv_keep, n_tps, 1, n_stream);
+                ggml_set_input(inp->self_ema_kq_mask);
+                ggml_set_name(inp->self_ema_kq_mask, "attn_inp_ema_kq_mask");
+            }
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2274,12 +2387,421 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     return inp;
 }
 
-llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
+llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv(int32_t layer) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, layer);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+static ggml_tensor * build_ema_sparse_k(
+        ggml_context * ctx,
+        ggml_tensor  * k,
+        ggml_tensor  * idxs) {
+    const int64_t n_embd_head = k->ne[0];
+    const int64_t n_head_kv   = k->ne[1];
+    const int64_t n_kv        = k->ne[2];
+    const int64_t n_stream    = k->ne[3];
+    const int64_t n_keep      = idxs->ne[0];
+
+    GGML_ASSERT(idxs->ne[1] == 1);
+    GGML_ASSERT(idxs->ne[2] == n_stream);
+
+    const ggml_type type_k = k->type;
+
+    ggml_tensor * rows = ggml_cont(ctx, k);
+    rows = ggml_reshape_4d(ctx, rows, n_embd_head*n_head_kv, n_kv, 1, n_stream);
+
+    ggml_tensor * selected = ggml_get_rows(ctx, rows, idxs);
+    if (type_k != GGML_TYPE_F32) {
+        selected = ggml_cast(ctx, selected, type_k);
+    }
+
+    return ggml_reshape_4d(ctx, selected, n_embd_head, n_head_kv, n_keep, n_stream);
+}
+
+static ggml_tensor * build_ema_sparse_v(
+        ggml_context * ctx,
+        ggml_tensor  * v,
+        ggml_tensor  * idxs,
+        int64_t        n_kv_ref) {
+    const int64_t n_keep   = idxs->ne[0];
+    const int64_t n_stream = idxs->ne[2];
+    const ggml_type type_v = v->type;
+
+    GGML_ASSERT(idxs->ne[1] == 1);
+
+    ggml_tensor * rows;
+    int64_t n_embd_head;
+    int64_t n_head_kv;
+    int64_t n_kv;
+
+    if (v->ne[0] == n_kv_ref) {
+        n_kv        = v->ne[0];
+        n_head_kv   = v->ne[1];
+        n_embd_head = v->ne[2];
+        GGML_ASSERT(v->ne[3] == n_stream);
+        rows = ggml_permute(ctx, v, 2, 1, 0, 3);
+    } else {
+        n_embd_head = v->ne[0];
+        n_head_kv   = v->ne[1];
+        n_kv        = v->ne[2];
+        GGML_ASSERT(v->ne[3] == n_stream);
+        rows = v;
+    }
+
+    rows = ggml_cont(ctx, rows);
+    rows = ggml_reshape_4d(ctx, rows, n_embd_head*n_head_kv, n_kv, 1, n_stream);
+
+    ggml_tensor * selected = ggml_get_rows(ctx, rows, idxs);
+    if (type_v != GGML_TYPE_F32) {
+        selected = ggml_cast(ctx, selected, type_v);
+    }
+
+    return ggml_reshape_4d(ctx, selected, n_embd_head, n_head_kv, n_keep, n_stream);
+}
+
+static float read_tensor_f32(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    const uint8_t * ptr = (const uint8_t *) t->data +
+        (size_t) i0 * t->nb[0] +
+        (size_t) i1 * t->nb[1] +
+        (size_t) i2 * t->nb[2] +
+        (size_t) i3 * t->nb[3];
+
+    switch (t->type) {
+        case GGML_TYPE_F32:
+            return *reinterpret_cast<const float *>(ptr);
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(ptr));
+        case GGML_TYPE_BF16:
+            return ggml_bf16_to_fp32(*reinterpret_cast<const ggml_bf16_t *>(ptr));
+        default:
+            return 0.0f;
+    }
+}
+
+static void write_tensor_f32(ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3, float value) {
+    uint8_t * ptr = (uint8_t *) t->data +
+        (size_t) i0 * t->nb[0] +
+        (size_t) i1 * t->nb[1] +
+        (size_t) i2 * t->nb[2] +
+        (size_t) i3 * t->nb[3];
+
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    *reinterpret_cast<float *>(ptr) = value;
+}
+
+static const uint8_t * tensor_ptr_const(const ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    return (const uint8_t *) t->data +
+        (size_t) i0 * t->nb[0] +
+        (size_t) i1 * t->nb[1] +
+        (size_t) i2 * t->nb[2] +
+        (size_t) i3 * t->nb[3];
+}
+
+static uint8_t * tensor_ptr(ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    return (uint8_t *) t->data +
+        (size_t) i0 * t->nb[0] +
+        (size_t) i1 * t->nb[1] +
+        (size_t) i2 * t->nb[2] +
+        (size_t) i3 * t->nb[3];
+}
+
+static float stream_dot_f32_f16_128_scalar(const float * q, const ggml_fp16_t * k) {
+    float sum = 0.0f;
+    for (int d = 0; d < 128; ++d) {
+        sum += q[d] * ggml_fp16_to_fp32(k[d]);
+    }
+    return sum;
+}
+
+static void stream_accum_f16_128_scalar(float * acc, const ggml_fp16_t * v, float weight) {
+    for (int d = 0; d < 128; ++d) {
+        acc[d] += weight * ggml_fp16_to_fp32(v[d]);
+    }
+}
+
+static void stream_store_scaled_128_scalar(float * dst, const float * acc, float scale) {
+    for (int d = 0; d < 128; ++d) {
+        dst[d] = acc[d] * scale;
+    }
+}
+
+#if defined(__ARM_NEON)
+static inline float stream_neon_hadd(float32x4_t v) {
+#if defined(__aarch64__)
+    return vaddvq_f32(v);
+#else
+    float32x2_t sum = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    sum = vpadd_f32(sum, sum);
+    return vget_lane_f32(sum, 0);
+#endif
+}
+
+static inline float32x4_t stream_load_f16x4_as_f32(const ggml_fp16_t * x) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    const uint16x4_t u = vld1_u16((const uint16_t *) x);
+    return vcvt_f32_f16(vreinterpret_f16_u16(u));
+#else
+    const float tmp[4] = {
+        ggml_fp16_to_fp32(x[0]),
+        ggml_fp16_to_fp32(x[1]),
+        ggml_fp16_to_fp32(x[2]),
+        ggml_fp16_to_fp32(x[3]),
+    };
+    return vld1q_f32(tmp);
+#endif
+}
+
+static float stream_dot_f32_f16_128_neon(const float * q, const ggml_fp16_t * k) {
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    for (int d = 0; d < 128; d += 16) {
+        const float32x4_t q0 = vld1q_f32(q + d +  0);
+        const float32x4_t q1 = vld1q_f32(q + d +  4);
+        const float32x4_t q2 = vld1q_f32(q + d +  8);
+        const float32x4_t q3 = vld1q_f32(q + d + 12);
+
+        const float32x4_t k0 = stream_load_f16x4_as_f32(k + d +  0);
+        const float32x4_t k1 = stream_load_f16x4_as_f32(k + d +  4);
+        const float32x4_t k2 = stream_load_f16x4_as_f32(k + d +  8);
+        const float32x4_t k3 = stream_load_f16x4_as_f32(k + d + 12);
+
+        acc0 = vmlaq_f32(acc0, q0, k0);
+        acc1 = vmlaq_f32(acc1, q1, k1);
+        acc2 = vmlaq_f32(acc2, q2, k2);
+        acc3 = vmlaq_f32(acc3, q3, k3);
+    }
+
+    return stream_neon_hadd(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+}
+
+static void stream_accum_f16_128_neon(float * acc, const ggml_fp16_t * v, float weight) {
+    const float32x4_t w = vdupq_n_f32(weight);
+    for (int d = 0; d < 128; d += 16) {
+        float32x4_t acc0 = vld1q_f32(acc + d +  0);
+        float32x4_t acc1 = vld1q_f32(acc + d +  4);
+        float32x4_t acc2 = vld1q_f32(acc + d +  8);
+        float32x4_t acc3 = vld1q_f32(acc + d + 12);
+
+        const float32x4_t v0 = stream_load_f16x4_as_f32(v + d +  0);
+        const float32x4_t v1 = stream_load_f16x4_as_f32(v + d +  4);
+        const float32x4_t v2 = stream_load_f16x4_as_f32(v + d +  8);
+        const float32x4_t v3 = stream_load_f16x4_as_f32(v + d + 12);
+
+        acc0 = vmlaq_f32(acc0, v0, w);
+        acc1 = vmlaq_f32(acc1, v1, w);
+        acc2 = vmlaq_f32(acc2, v2, w);
+        acc3 = vmlaq_f32(acc3, v3, w);
+
+        vst1q_f32(acc + d +  0, acc0);
+        vst1q_f32(acc + d +  4, acc1);
+        vst1q_f32(acc + d +  8, acc2);
+        vst1q_f32(acc + d + 12, acc3);
+    }
+}
+
+static void stream_store_scaled_128_neon(float * dst, const float * acc, float scale) {
+    const float32x4_t s = vdupq_n_f32(scale);
+    for (int d = 0; d < 128; d += 16) {
+        vst1q_f32(dst + d +  0, vmulq_f32(vld1q_f32(acc + d +  0), s));
+        vst1q_f32(dst + d +  4, vmulq_f32(vld1q_f32(acc + d +  4), s));
+        vst1q_f32(dst + d +  8, vmulq_f32(vld1q_f32(acc + d +  8), s));
+        vst1q_f32(dst + d + 12, vmulq_f32(vld1q_f32(acc + d + 12), s));
+    }
+}
+#endif
+
+static inline float stream_dot_f32_f16_128(const float * q, const ggml_fp16_t * k) {
+#if defined(__ARM_NEON)
+    return stream_dot_f32_f16_128_neon(q, k);
+#else
+    return stream_dot_f32_f16_128_scalar(q, k);
+#endif
+}
+
+static inline void stream_accum_f16_128(float * acc, const ggml_fp16_t * v, float weight) {
+#if defined(__ARM_NEON)
+    stream_accum_f16_128_neon(acc, v, weight);
+#else
+    stream_accum_f16_128_scalar(acc, v, weight);
+#endif
+}
+
+static inline void stream_store_scaled_128(float * dst, const float * acc, float scale) {
+#if defined(__ARM_NEON)
+    stream_store_scaled_128_neon(dst, acc, scale);
+#else
+    stream_store_scaled_128_scalar(dst, acc, scale);
+#endif
+}
+
+static void stream_kv_attn_op(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * params = static_cast<const llm_graph_input_stream_kv *>(userdata);
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const int64_t n_embd_head = q->ne[0];
+    const int64_t n_head      = q->ne[1];
+    const int64_t n_tokens    = q->ne[2];
+    const int64_t n_head_kv   = k->ne[1];
+    const int64_t n_kv        = k->ne[2];
+    const int64_t n_stream    = k->ne[3];
+
+    GGML_ASSERT(n_tokens == n_stream);
+    GGML_ASSERT(mask->ne[1] == 1);
+    GGML_ASSERT(mask->ne[3] == n_stream);
+    GGML_ASSERT(n_head % n_head_kv == 0);
+    GGML_ASSERT((int64_t) params->n_visible.size() == n_stream);
+
+    const bool v_trans = v->ne[0] == n_kv;
+    const int64_t n_head_per_kv = n_head / n_head_kv;
+    const int32_t sink = std::max<int32_t>(0, params->sink);
+    const int32_t recent = std::max<int32_t>(0, params->recent);
+    const int64_t n_keep_cap = std::min<int64_t>(n_kv, (int64_t) sink + recent);
+
+    const bool use_fast_f16 =
+        n_embd_head == 128 &&
+        q->type   == GGML_TYPE_F32 &&
+        k->type   == GGML_TYPE_F16 &&
+        v->type   == GGML_TYPE_F16 &&
+        dst->type == GGML_TYPE_F32 &&
+        q->nb[0]   == (int64_t) sizeof(float) &&
+        k->nb[0]   == (int64_t) sizeof(ggml_fp16_t) &&
+        dst->nb[0] == (int64_t) sizeof(float) &&
+        !v_trans &&
+        v->nb[0]   == (int64_t) sizeof(ggml_fp16_t);
+
+    alignas(16) float   acc_fixed[256];
+    alignas(16) float   scores_fixed[512];
+    int32_t             kept_fixed[512];
+
+    std::vector<float> acc_vec;
+    std::vector<float> scores_vec;
+    std::vector<int32_t> kept_vec;
+
+    const bool use_fixed_acc = n_embd_head <= (int64_t) (sizeof(acc_fixed)/sizeof(acc_fixed[0]));
+    const bool use_fixed_keep = n_keep_cap <= (int64_t) (sizeof(scores_fixed)/sizeof(scores_fixed[0]));
+
+    if (!use_fixed_acc) {
+        acc_vec.resize(n_embd_head);
+    }
+    if (!use_fixed_keep) {
+        scores_vec.resize(n_keep_cap);
+        kept_vec.resize(n_keep_cap);
+    }
+
+    const int64_t n_work = n_tokens * n_head;
+    for (int64_t work = ith; work < n_work; work += nth) {
+        const int64_t token = work / n_head;
+        const int64_t hq    = work % n_head;
+        const int64_t hk    = hq / n_head_per_kv;
+        const int64_t stream = token;
+
+        const int64_t n_visible = std::max<int64_t>(0, std::min<int64_t>(params->n_visible[stream], n_kv));
+        const int64_t sink_end = std::min<int64_t>(sink, n_visible);
+        const int64_t recent_begin = std::max<int64_t>(sink_end, n_visible - recent);
+
+        float * acc = use_fixed_acc ? acc_fixed : acc_vec.data();
+        float * scores = use_fixed_keep ? scores_fixed : scores_vec.data();
+        int32_t * kept = use_fixed_keep ? kept_fixed : kept_vec.data();
+
+        const float * q_fast = nullptr;
+        float * dst_fast = nullptr;
+        if (use_fast_f16) {
+            q_fast = (const float *) tensor_ptr_const(q, 0, hq, token, 0);
+            dst_fast = (float *) tensor_ptr(dst, hq * n_embd_head, token, 0, 0);
+        }
+
+        auto calc_score = [&](int64_t kv) -> float {
+            if (use_fast_f16) {
+                const auto * k_fast = (const ggml_fp16_t *) tensor_ptr_const(k, 0, hk, kv, stream);
+                return stream_dot_f32_f16_128(q_fast, k_fast) * params->kq_scale;
+            }
+
+            float score = 0.0f;
+            for (int64_t d = 0; d < n_embd_head; ++d) {
+                score += read_tensor_f32(q, d, hq, token, 0) * read_tensor_f32(k, d, hk, kv, stream);
+            }
+            return score * params->kq_scale;
+        };
+
+        float score_max = -INFINITY;
+        int64_t n_kept = 0;
+        auto add_score = [&](int64_t kv) {
+            const float score = calc_score(kv);
+            kept[n_kept] = kv;
+            scores[n_kept] = score;
+            ++n_kept;
+            score_max = std::max(score_max, score);
+        };
+
+        for (int64_t kv = 0; kv < sink_end; ++kv) {
+            add_score(kv);
+        }
+        for (int64_t kv = recent_begin; kv < n_visible; ++kv) {
+            add_score(kv);
+        }
+
+        std::fill(acc, acc + n_embd_head, 0.0f);
+        float score_sum = 0.0f;
+
+        if (std::isfinite(score_max)) {
+            for (int64_t i = 0; i < n_kept; ++i) {
+                const int64_t kv = kept[i];
+                const float score = scores[i];
+                const float weight = expf(score - score_max);
+                score_sum += weight;
+
+                if (use_fast_f16) {
+                    const auto * v_fast = (const ggml_fp16_t *) tensor_ptr_const(v, 0, hk, kv, stream);
+                    stream_accum_f16_128(acc, v_fast, weight);
+                } else {
+                    for (int64_t d = 0; d < n_embd_head; ++d) {
+                        const float value = v_trans ?
+                            read_tensor_f32(v, kv, hk, d, stream) :
+                            read_tensor_f32(v, d,  hk, kv, stream);
+                        acc[d] += weight * value;
+                    }
+                }
+            }
+        }
+
+        const float inv_sum = score_sum > 0.0f ? 1.0f / score_sum : 0.0f;
+        if (use_fast_f16) {
+            stream_store_scaled_128(dst_fast, acc, inv_sum);
+        } else {
+            for (int64_t d = 0; d < n_embd_head; ++d) {
+                write_tensor_f32(dst, d + hq * n_embd_head, token, 0, 0, acc[d] * inv_sum);
+            }
+        }
+    }
+}
+
+static ggml_tensor * build_stream_kv_attn(
+        ggml_context * ctx,
+        llm_graph_result * res,
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * mask,
+        int32_t sink,
+        int32_t recent,
+        float kq_scale) {
+    auto inp = std::make_unique<llm_graph_input_stream_kv>(sink, recent, kq_scale, k->ne[3]);
+    auto * params = static_cast<llm_graph_input_stream_kv *>(res->add_input(std::move(inp)));
+
+    ggml_tensor * args[] = { q, k, v, mask };
+    const int n_tasks = std::max<int64_t>(1, std::min<int64_t>(q->ne[1] * q->ne[2], 256));
+    return ggml_custom_4d(ctx, GGML_TYPE_F32,
+            q->ne[0] * q->ne[1], q->ne[2], 1, 1,
+            args, 4, stream_kv_attn_op, n_tasks, params);
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -2329,8 +2851,52 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * mask = kq_mask;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    const bool can_stream_kv =
+        cparams.stream_kv_enabled &&
+        cparams.stream_kv_active &&
+        kq_b == nullptr &&
+        sinks == nullptr &&
+        v_mla == nullptr &&
+        kq_mask->ne[1] == 1 &&
+        q_cur->ne[2] == k->ne[3] &&
+        cparams.stream_kv_sink + cparams.stream_kv_recent > 0;
+
+    if (can_stream_kv) {
+        ggml_tensor * cur = build_stream_kv_attn(ctx0, res, q, k, v, mask,
+                cparams.stream_kv_sink, cparams.stream_kv_recent, kq_scale);
+        cb(cur, "stream_kqv_out", il);
+        if (wo) {
+            if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+                cur = build_lora_mm(wo, cur);
+                ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                if (wo_s) {
+                    cur = ggml_mul(ctx0, cur, wo_s);
+                }
+            } else {
+                cur = build_lora_mm(wo, cur, wo_s);
+            }
+            cb(cur, "stream_kqv_wo", il);
+        }
+        if (wo_b) {
+            cur = ggml_add(ctx0, cur, wo_b);
+        }
+        return cur;
+    }
+
+    if (inp->has_ema_kv()) {
+        GGML_ASSERT(kq_mask->ne[1] == 1);
+        ggml_tensor * idxs = inp->get_ema_kv_idxs();
+        k = build_ema_sparse_k(ctx0, k, idxs);
+        v = build_ema_sparse_v(ctx0, v, idxs, kq_mask->ne[0]);
+        mask = inp->get_ema_kq_mask();
+        cb(k, "ema_k", il);
+        cb(v, "ema_v", il);
+        cb(mask, "ema_kq_mask", il);
+    }
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -2853,7 +3419,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), -1);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

@@ -1,0 +1,237 @@
+================================================================================
+  QWEN3-4B CXL 流水线并行推理 — 使用指南
+  基于 llama.cpp pipeline-brick + cxl_transport
+  飞腾双板 (2×64核, 8 NUMA, 256GB) 通过 CXL/PCIe 互联
+================================================================================
+
+一、前提条件
+──────────────────────────────────────────────────────────────────────────────
+
+1. 飞腾双板机器，两块主板通过 CXL/PCIe 互联
+2. OS 已看到全部 128 核和 256GB 内存
+3. 已安装依赖：gcc/g++, cmake, libnuma-dev
+4. QWEN3-4B 的 GGUF 模型文件已下载到机器上
+   （推荐 Q4_K_M 量化，约 2.4GB，下载地址见末尾）
+
+
+二、编译
+──────────────────────────────────────────────────────────────────────────────
+
+  cd ~/llama.cpp
+  mkdir -p build && cd build
+  cmake .. -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+  make pipeline-brick -j$(nproc)
+
+  编译产物：build/bin/pipeline-brick
+
+
+三、启动 Head 进程（CPU0, NUMA 0-3）
+──────────────────────────────────────────────────────────────────────────────
+
+  在终端 1 中执行：
+
+  MODEL=./qwen3-4b-Q4_K_M.gguf
+
+  sudo taskset -c 0-63 ./bin/pipeline-brick \
+    --hardware \
+    --transport cxl \
+    --role head \
+    --model "$MODEL" \
+    --tx-mw /dev/shm/cxl-h2t \
+    --rx-mw /dev/shm/cxl-t2h \
+    --head-numa 0-3 \
+    --tail-numa 4-7 \
+    --layer-start 0 \
+    --layer-end 18 \
+    --brick-id 0 \
+    --peer-brick-id 1 \
+    --ctx-size 2048 \
+    --n-predict 128 \
+    --parallel 4 \
+    --threads 8 \
+    --prefill-chunk 32 \
+    --hidden-dtype bf16 \
+    --prompt "介绍一下你自己"
+
+
+四、启动 Tail 进程（CPU1, NUMA 4-7）
+──────────────────────────────────────────────────────────────────────────────
+
+  在终端 2 中执行（Head 启动 1-2 秒后再启动 Tail）：
+
+  MODEL=./qwen3-4b-Q4_K_M.gguf
+
+  sudo taskset -c 64-127 ./bin/pipeline-brick \
+    --hardware \
+    --transport cxl \
+    --role tail \
+    --model "$MODEL" \
+    --tx-mw /dev/shm/cxl-t2h \
+    --rx-mw /dev/shm/cxl-h2t \
+    --head-numa 0-3 \
+    --tail-numa 4-7 \
+    --layer-start 18 \
+    --layer-end 36 \
+    --brick-id 1 \
+    --peer-brick-id 0 \
+    --ctx-size 2048 \
+    --n-predict 128 \
+    --parallel 4 \
+    --threads 8 \
+    --prefill-chunk 32 \
+    --hidden-dtype bf16
+
+
+五、参数说明
+──────────────────────────────────────────────────────────────────────────────
+
+核心参数：
+  --hardware          使用硬件模式（两个独立进程通过共享内存通信）
+  --transport cxl     使用 CXL 优化传输层（替代默认的 ntb-mw）
+  --role head|tail    当前进程的角色：head=前半段, tail=后半段
+  --model PATH        模型文件路径
+
+层切分：
+  --layer-start N     本 brick 负责的起始层（包含），head=0, tail=18
+  --layer-end N       本 brick 负责的结束层（不包含），head=18, tail=36
+                      QWEN3-4B 共 36 层，在第 18 层处均匀切分
+
+共享内存（CXL transport 自动创建文件，无需手动创建）：
+  --tx-mw PATH        发送窗口文件路径
+  --rx-mw PATH        接收窗口文件路径
+  Head:  tx=/dev/shm/cxl-h2t  rx=/dev/shm/cxl-t2h
+  Tail:  tx=/dev/shm/cxl-t2h  rx=/dev/shm/cxl-h2h
+  （注意 Head 和 Tail 的 tx/rx 是互换的）
+
+NUMA 绑定（CXL 关键优化）：
+  --head-numa NODES   Head 进程所在 NUMA 节点，如 0-3
+  --tail-numa NODES   Tail 进程所在 NUMA 节点，如 4-7
+  taskset -c CPU-RANGE 绑定 CPU 核心
+  cxl_transport 会将 h2t 共享窗口 mbind 到 tail NUMA，
+  t2h 共享窗口 mbind 到 head NUMA，确保 CXL 读操作命中远端最优路径
+
+推理控制：
+  --n-predict N       生成 token 数，默认 128
+  --parallel N        同时推理的分支数（越多 CXL 传输越密集），默认 4
+  --ctx-size N        KV cache 大小，默认 2048
+  --threads N         每个 brick 的计算线程数，默认 8
+  --prefill-chunk N   每次预填充的 token 数，默认 32
+
+数据精度：
+  --hidden-dtype bf16|f32    传输 hidden state 的精度
+                              bf16 = 数据量减半、CXL 传输更快
+                              f32  = 精度无损（与单卡推理完全一致）
+
+调试：
+  --verbose           输出详细日志
+  --quiet             静默模式
+
+
+六、对比测试（CXL vs 原始）
+──────────────────────────────────────────────────────────────────────────────
+
+  测试 1：CXL 流水线并行（上面三/四的步骤）
+
+  测试 2：原始单板推理（baseline）：
+    sudo taskset -c 0-63 ./bin/pipeline-brick \
+      --single-system \
+      --model "$MODEL" \
+      --head-numa 0-3 \
+      --tail-numa 0-3 \
+      --ctx-size 2048 \
+      --n-predict 128 \
+      --parallel 1 \
+      --prompt "介绍一下你自己"
+
+  测试 3：用 ntb-mw transport（对比 CXL 优化效果）：
+    # Head
+    sudo taskset -c 0-63 ./bin/pipeline-brick \
+      --hardware --transport ntb-mw --role head \
+      --model "$MODEL" \
+      --tx-mw /dev/shm/ntb-h2t --rx-mw /dev/shm/ntb-t2h \
+      --layer-start 0 --layer-end 18 --brick-id 0 --peer-brick-id 1 \
+      --n-predict 128 --parallel 4 &
+
+    # Tail
+    sudo taskset -c 64-127 ./bin/pipeline-brick \
+      --hardware --transport ntb-mw --role tail \
+      --model "$MODEL" \
+      --tx-mw /dev/shm/ntb-t2h --rx-mw /dev/shm/ntb-h2h \
+      --layer-start 18 --layer-end 36 --brick-id 1 --peer-brick-id 0 \
+      --n-predict 128 --parallel 4 &
+
+    wait
+
+
+七、单系统模式（最简单，无需手动开两个终端）
+──────────────────────────────────────────────────────────────────────────────
+
+  一个命令起两个子进程，自动 fork + NUMA 绑定：
+
+  ./bin/pipeline-brick \
+    --single-system \
+    --transport cxl \
+    --model ./qwen3-4b-Q4_K_M.gguf \
+    --head-numa 0-3 \
+    --tail-numa 4-7 \
+    --ctx-size 2048 \
+    --n-predict 128 \
+    --parallel 4 \
+    --threads 8 \
+    --prompt "介绍一下你自己"
+
+
+八、故障排查
+──────────────────────────────────────────────────────────────────────────────
+
+  1. "open --tx-mw failed: Permission denied"
+     → 确保 /dev/shm/ 可写，或用 sudo 运行
+
+  2. "mbind failed"
+     → 确认 libnuma 已安装：sudo apt install libnuma-dev
+     → 确认 NUMA 节点号正确：numactl --hardware
+
+  3. Tail 进程一直等待不输出
+     → 确认 Head 进程已启动并开始计算
+     → 确认 --parallel 参数两边一致
+     → 确认 tx-mw/rx-mw 路径 Head 和 Tail 互换正确
+     → 检查 --prompt 只在 Head 侧传
+
+  4. 输出与单卡推理不一致
+     → 将 --hidden-dtype 改为 f32（bf16 有微小精度损失）
+
+  5. 编译报错 "yield undeclared"
+     → ARM64 平台确认：uname -m 输出 aarch64
+     → x86 平台会自动 fallback 到 sleep_us
+
+  6. 查看共享窗口是否在正确的 NUMA 上：
+     cat /proc/$(pgrep pipeline-brick)/numa_maps | grep cxl
+
+
+九、性能预期（飞腾 2.5GHz × 64核 × 2 板）
+──────────────────────────────────────────────────────────────────────────────
+
+  模式                        吞吐量              说明
+  ────────────────────────────────────────────────────────────────────────
+  单板 64核                    ~2-3 tok/s         baseline
+  CXL 流水线 (f32 hidden)      ~3.5-5 tok/s       两板各跑一半层
+  CXL 流水线 (bf16 hidden)     ~3.5-5 tok/s       传输数据量减半
+  CXL 流水线 (parallel=8)      ~5-8 tok/s         更多并行度
+
+  CXL transport vs ntb-mw transport：
+    单次传输延迟：      ~1.5µs vs ~4.9µs (3.3x)
+    每 token syscall：  0 vs 2
+
+
+十、模型下载
+──────────────────────────────────────────────────────────────────────────────
+
+  QWEN3-4B-Instruct Q4_K_M (推荐)：
+  https://huggingface.co/Qwen/Qwen3-4B-Instruct-GGUF
+
+  QWEN3-4B-Instruct f32（精度对比用）：
+  https://huggingface.co/Qwen/Qwen3-4B-Instruct-GGUF
+
+================================================================================
+  文档版本：2026-06-14  |  硬件：飞腾双板 CXL/PCIe 互联  |  模型：QWEN3-4B
+================================================================================

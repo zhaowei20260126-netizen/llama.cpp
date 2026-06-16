@@ -288,6 +288,12 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    enum llama_pipeline_brick_role {
+        LLAMA_PIPELINE_BRICK_ROLE_NONE = 0,
+        LLAMA_PIPELINE_BRICK_ROLE_HEAD = 1,
+        LLAMA_PIPELINE_BRICK_ROLE_TAIL = 2,
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -315,6 +321,12 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // [EXPERIMENTAL] local two-Brick pipeline prototype. Only Qwen3 dense is supported.
+        bool pipeline_brick_enabled;
+        enum llama_pipeline_brick_role pipeline_brick_role;
+        int32_t pipeline_brick_layer_start;
+        int32_t pipeline_brick_layer_end;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -330,6 +342,14 @@ extern "C" {
         llama_seq_id           seq_id;
         struct llama_sampler * sampler;
     };
+
+    typedef int32_t (*llama_ema_kv_select_callback)(
+            void * user_data,
+            int32_t layer,
+            int32_t seq_id,
+            int32_t pos,
+            int32_t n_keep,
+            int32_t * indices);
 
     // NOTE: changing the default values of parameters marked as [EXPERIMENTAL] may cause crashes or incorrect results in certain configurations
     //       https://github.com/ggml-org/llama.cpp/pull/7544
@@ -370,6 +390,22 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+
+        // [EXPERIMENTAL] decode-only sparse attention driven by EMA KV selection.
+        bool ema_kv_enabled;
+        bool ema_kv_active;
+        int32_t ema_kv_keep;
+        int32_t ema_kv_recent;
+        int32_t ema_kv_sink;
+        float ema_kv_alpha;
+        llama_ema_kv_select_callback ema_kv_select;
+        void * ema_kv_select_user_data;
+
+        // [EXPERIMENTAL] decode-only StreamingLLM-style sparse attention.
+        bool stream_kv_enabled;
+        bool stream_kv_active;
+        int32_t stream_kv_sink;
+        int32_t stream_kv_recent;
 
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
@@ -977,6 +1013,14 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    LLAMA_API void llama_set_ema_kv_active(struct llama_context * ctx, bool active);
+    LLAMA_API void llama_set_ema_kv_select_callback(
+            struct llama_context * ctx,
+            llama_ema_kv_select_callback callback,
+            void * user_data);
+
+    LLAMA_API void llama_set_stream_kv_active(struct llama_context * ctx, bool active);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

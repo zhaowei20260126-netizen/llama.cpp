@@ -2145,6 +2145,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    if (arch == LLM_ARCH_QWEN3 && this->params.pipeline_brick_enabled) {
+                        const auto prev_filter = filter;
+                        const int32_t layer_start = this->params.pipeline_brick_layer_start;
+                        const int32_t layer_end   = this->params.pipeline_brick_layer_end;
+                        filter = [=](uint32_t il) {
+                            const bool in_range = (int32_t) il >= layer_start && (int32_t) il < layer_end;
+                            return in_range && (!prev_filter || prev_filter(il));
+                        };
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         GGML_ASSERT(hparams.is_swa_any());
 
@@ -2259,6 +2269,10 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.pipeline_brick_enabled      =*/ false,
+        /*.pipeline_brick_role         =*/ LLAMA_PIPELINE_BRICK_ROLE_NONE,
+        /*.pipeline_brick_layer_start  =*/ 0,
+        /*.pipeline_brick_layer_end    =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

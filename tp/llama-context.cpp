@@ -70,18 +70,6 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
-    cparams.ema_kv_enabled          = params.ema_kv_enabled;
-    cparams.ema_kv_active           = params.ema_kv_active;
-    cparams.ema_kv_keep             = params.ema_kv_keep;
-    cparams.ema_kv_recent           = params.ema_kv_recent;
-    cparams.ema_kv_sink             = params.ema_kv_sink;
-    cparams.ema_kv_alpha            = params.ema_kv_alpha;
-    cparams.ema_kv_select           = params.ema_kv_select;
-    cparams.ema_kv_select_user_data = params.ema_kv_select_user_data;
-    cparams.stream_kv_enabled       = params.stream_kv_enabled;
-    cparams.stream_kv_active        = params.stream_kv_active;
-    cparams.stream_kv_sink          = params.stream_kv_sink;
-    cparams.stream_kv_recent        = params.stream_kv_recent;
 
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
@@ -197,12 +185,6 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    if (cparams.ema_kv_enabled) {
-        cparams.flash_attn = false;
-        cparams.auto_fa = false;
-        LLAMA_LOG_INFO("%s: disabling Flash Attention for EMA KV attention\n", __func__);
-    }
-
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
@@ -254,8 +236,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
-    LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__,
-            cparams.flash_attn ? (cparams.auto_fa ? "auto" : "enabled") : "disabled");
+    LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
@@ -1153,33 +1134,6 @@ void llama_context::set_causal_attn(bool value) {
 
     cparams.causal_attn = value;
 
-    sched_need_reserve = true;
-}
-
-void llama_context::set_ema_kv_active(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
-
-    if (cparams.ema_kv_active == value) {
-        return;
-    }
-
-    cparams.ema_kv_active = value;
-    sched_need_reserve = true;
-}
-
-void llama_context::set_ema_kv_select_callback(llama_ema_kv_select_callback callback, void * user_data) {
-    cparams.ema_kv_select = callback;
-    cparams.ema_kv_select_user_data = user_data;
-}
-
-void llama_context::set_stream_kv_active(bool value) {
-    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
-
-    if (cparams.stream_kv_active == value) {
-        return;
-    }
-
-    cparams.stream_kv_active = value;
     sched_need_reserve = true;
 }
 
@@ -2276,9 +2230,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    if (cparams.ema_kv_enabled || cparams.ema_kv_active || cparams.stream_kv_enabled || cparams.stream_kv_active) {
-        res += 16u*model.hparams.n_layer();
-    }
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
@@ -2369,6 +2320,8 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.tp_rank     =*/ ggml_get_tp_rank(),
+        /*.tp_size     =*/ ggml_get_tp_size(),
     };
 }
 
@@ -3427,18 +3380,6 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
-        /*.ema_kv_enabled              =*/ false,
-        /*.ema_kv_active               =*/ false,
-        /*.ema_kv_keep                 =*/ 0,
-        /*.ema_kv_recent               =*/ 0,
-        /*.ema_kv_sink                 =*/ 0,
-        /*.ema_kv_alpha                =*/ 0.0f,
-        /*.ema_kv_select               =*/ nullptr,
-        /*.ema_kv_select_user_data     =*/ nullptr,
-        /*.stream_kv_enabled           =*/ false,
-        /*.stream_kv_active            =*/ false,
-        /*.stream_kv_sink              =*/ 0,
-        /*.stream_kv_recent            =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
@@ -3613,21 +3554,6 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
-}
-
-void llama_set_ema_kv_active(llama_context * ctx, bool active) {
-    ctx->set_ema_kv_active(active);
-}
-
-void llama_set_ema_kv_select_callback(
-        llama_context * ctx,
-        llama_ema_kv_select_callback callback,
-        void * user_data) {
-    ctx->set_ema_kv_select_callback(callback, user_data);
-}
-
-void llama_set_stream_kv_active(llama_context * ctx, bool active) {
-    ctx->set_stream_kv_active(active);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

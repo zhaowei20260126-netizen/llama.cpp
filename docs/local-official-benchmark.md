@@ -49,7 +49,14 @@ build/bin/llama-batched-bench
   -t 8 \
   -c 2048 \
   -n 64 \
-  --no-warmup \
+  --no-warmu./build/bin/llama-pipeline-brick \
+  --model models/qwen3-4b/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --prompt "你好" \
+  --ctx-size 128 \
+  --threads 4 \
+  --n-predict 4 \
+  --bricks 2 \
+  --parallel 2p \
   -p "请用三句话介绍一下 llama.cpp 是什么。"
 ```
 

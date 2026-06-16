@@ -307,11 +307,9 @@ public:
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            const llama_kv_cache_context * mctx,
-            int32_t layer = -1) :
+            const llama_kv_cache_context * mctx) :
         hparams(hparams),
         cparams(cparams),
-        layer(layer),
         mctx(mctx) {
     }
     ~llm_graph_input_attn_kv() = default;
@@ -324,17 +322,12 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-    ggml_tensor * get_ema_kv_idxs() const { return self_ema_kv_idxs; }
-    ggml_tensor * get_ema_kq_mask() const { return self_ema_kq_mask; }
-    bool has_ema_kv() const { return self_ema_kv_idxs != nullptr && self_ema_kq_mask != nullptr; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_ema_kv_idxs = nullptr; // I32 [n_keep, n_batch/n_stream, n_stream]
-    ggml_tensor * self_ema_kq_mask = nullptr; // F32 [n_keep, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -346,37 +339,7 @@ public:
     const llama_hparams hparams;
     const llama_cparams cparams;
 
-    const int32_t layer;
     const llama_kv_cache_context * mctx;
-};
-
-class llm_graph_input_stream_kv : public llm_graph_input_i {
-public:
-    llm_graph_input_stream_kv(
-            int32_t sink,
-            int32_t recent,
-              float kq_scale,
-            int32_t n_stream) :
-        sink(sink),
-        recent(recent),
-        kq_scale(kq_scale),
-        n_visible(n_stream, 0) {
-    }
-
-    void set_input(const llama_ubatch * ubatch) override {
-        GGML_ASSERT((int64_t) n_visible.size() == ubatch->n_tokens);
-        for (int64_t i = 0; i < ubatch->n_tokens; ++i) {
-            n_visible[i] = ubatch->pos[i] + 1;
-        }
-    }
-
-    bool can_reuse(const llm_graph_params & params) override;
-
-    const int32_t sink;
-    const int32_t recent;
-    const float kq_scale;
-
-    std::vector<int32_t> n_visible;
 };
 
 // V-less input for the KV cache
@@ -408,7 +371,6 @@ public:
 
     const llama_hparams hparams;
     const llama_cparams cparams;
-    int32_t layer = -1;
 
     const llama_kv_cache_context * mctx;
 };
@@ -664,6 +626,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // tensor parallelism
+    int tp_rank = 0;
+    int tp_size = 1;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -723,12 +689,6 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
-            cparams.ema_kv_active == other.cparams.ema_kv_active &&
-            cparams.ema_kv_keep == other.cparams.ema_kv_keep &&
-            cparams.stream_kv_enabled == other.cparams.stream_kv_enabled &&
-            cparams.stream_kv_active == other.cparams.stream_kv_active &&
-            cparams.stream_kv_sink == other.cparams.stream_kv_sink &&
-            cparams.stream_kv_recent == other.cparams.stream_kv_recent &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -1027,7 +987,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv(int32_t layer = -1) const;
+    llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

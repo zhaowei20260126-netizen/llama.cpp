@@ -43,6 +43,20 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool ema_kv_enabled;
+    bool ema_kv_active;
+    bool stream_kv_enabled;
+    bool stream_kv_active;
+
+    int32_t ema_kv_keep;
+    int32_t ema_kv_recent;
+    int32_t ema_kv_sink;
+    float ema_kv_alpha;
+    int32_t stream_kv_sink;
+    int32_t stream_kv_recent;
+
+    llama_ema_kv_select_callback ema_kv_select;
+    void * ema_kv_select_user_data;
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

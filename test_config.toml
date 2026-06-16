@@ -1,0 +1,7 @@
+model = "gpt-5.5"
+model_provider = "codexmanager"
+
+[model_providers.codexmanager]
+base_url = "https://hotaruapi.com/v1"
+wire_api = "responses"
+

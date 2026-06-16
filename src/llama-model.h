@@ -626,6 +626,11 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    bool pipeline_brick_enabled() const { return params.pipeline_brick_enabled; }
+    enum llama_pipeline_brick_role pipeline_brick_role() const { return params.pipeline_brick_role; }
+    int32_t pipeline_brick_layer_start() const { return params.pipeline_brick_layer_start; }
+    int32_t pipeline_brick_layer_end() const { return params.pipeline_brick_layer_end; }
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
