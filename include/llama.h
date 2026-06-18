@@ -292,6 +292,7 @@ extern "C" {
         LLAMA_PIPELINE_BRICK_ROLE_NONE = 0,
         LLAMA_PIPELINE_BRICK_ROLE_HEAD = 1,
         LLAMA_PIPELINE_BRICK_ROLE_TAIL = 2,
+        LLAMA_PIPELINE_BRICK_ROLE_STAGE = 3,
     };
 
     struct llama_model_params {
@@ -326,6 +327,8 @@ extern "C" {
         enum llama_pipeline_brick_role pipeline_brick_role;
         int32_t pipeline_brick_layer_start;
         int32_t pipeline_brick_layer_end;
+        int32_t pipeline_brick_tp_rank;
+        int32_t pipeline_brick_tp_size;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

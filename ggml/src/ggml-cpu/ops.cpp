@@ -11,6 +11,12 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 // ggml_compute_forward_dup
 
@@ -9969,6 +9975,300 @@ void ggml_compute_forward_glu(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+struct ggml_tp_shm_state {
+    volatile int barrier_count;
+    volatile int barrier_generation;
+};
+
+struct ggml_tp_runtime {
+    int rank;
+    int size;
+    ggml_tp_shm_state * state;
+    uint8_t * data;
+    size_t data_size;
+};
+
+struct ggml_tp_stats {
+    uint64_t calls;
+    uint64_t elements;
+    int64_t copy_us;
+    int64_t wait_before_reduce_us;
+    int64_t reduce_us;
+    int64_t wait_after_reduce_us;
+    int64_t last_end_us;
+};
+
+static constexpr int GGML_TP_PROFILE_SLOTS = 36;
+
+struct ggml_tp_slot_stats {
+    uint64_t calls;
+    uint64_t elements;
+    int64_t copy_us;
+    int64_t wait_before_reduce_us;
+    int64_t reduce_us;
+    int64_t wait_after_reduce_us;
+    int64_t gap_before_us;
+};
+
+static ggml_tp_runtime g_tp_runtime = { 0, 1, nullptr, nullptr, 0 };
+static ggml_tp_stats g_tp_stats = {};
+static ggml_tp_slot_stats g_tp_slot_stats[GGML_TP_PROFILE_SLOTS] = {};
+
+static void ggml_tp_thread_barrier(const ggml_compute_params * params) {
+    if (params->nth > 1) {
+        ggml_barrier(params->threadpool);
+    }
+}
+
+static void ggml_tp_reduce_sum_f32(
+        float * out,
+        const float * shm,
+        int rank_count,
+        int64_t nelem,
+        int64_t begin,
+        int64_t end) {
+    if (rank_count == 4) {
+        const float * src0 = shm;
+        const float * src1 = shm + nelem;
+        const float * src2 = shm + 2 * nelem;
+        const float * src3 = shm + 3 * nelem;
+
+        int64_t i = begin;
+
+#if defined(__aarch64__)
+        for (; i + 4 <= end; i += 4) {
+            const float32x4_t v0 = vld1q_f32(src0 + i);
+            const float32x4_t v1 = vld1q_f32(src1 + i);
+            const float32x4_t v2 = vld1q_f32(src2 + i);
+            const float32x4_t v3 = vld1q_f32(src3 + i);
+            const float32x4_t sum01 = vaddq_f32(v0, v1);
+            const float32x4_t sum23 = vaddq_f32(v2, v3);
+            vst1q_f32(out + i, vaddq_f32(sum01, sum23));
+        }
+#endif
+
+        for (; i < end; ++i) {
+            out[i] = src0[i] + src1[i] + src2[i] + src3[i];
+        }
+        return;
+    }
+
+    for (int64_t i = begin; i < end; ++i) {
+        float sum = 0.0f;
+        for (int r = 0; r < rank_count; ++r) {
+            sum += shm[(size_t) r * (size_t) nelem + (size_t) i];
+        }
+        out[i] = sum;
+    }
+}
+
+extern "C" void ggml_tp_shm_init(int rank, int size, void * shm_base, size_t shm_size) {
+    GGML_ASSERT(rank >= 0);
+    GGML_ASSERT(size >= 1);
+
+    g_tp_runtime.rank = rank;
+    g_tp_runtime.size = size;
+    g_tp_stats = {};
+    memset(g_tp_slot_stats, 0, sizeof(g_tp_slot_stats));
+
+    if (size == 1) {
+        g_tp_runtime.state = nullptr;
+        g_tp_runtime.data = nullptr;
+        g_tp_runtime.data_size = 0;
+        return;
+    }
+
+    GGML_ASSERT(shm_base != nullptr);
+    GGML_ASSERT(shm_size > sizeof(ggml_tp_shm_state) + 64);
+
+    const size_t data_offset = GGML_PAD(sizeof(ggml_tp_shm_state), 64);
+    g_tp_runtime.state = (ggml_tp_shm_state *) shm_base;
+    g_tp_runtime.data = (uint8_t *) shm_base + data_offset;
+    g_tp_runtime.data_size = shm_size - data_offset;
+}
+
+extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
+    if (g_tp_runtime.size <= 1 && g_tp_stats.calls == 0) {
+        return;
+    }
+
+    const int64_t total_us =
+        g_tp_stats.copy_us +
+        g_tp_stats.wait_before_reduce_us +
+        g_tp_stats.reduce_us +
+        g_tp_stats.wait_after_reduce_us;
+
+    fprintf(stderr,
+            "%s role=%s rank=%d/%d calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms total=%.3f ms\n",
+            prefix ? prefix : "ggml TP all-reduce:",
+            role ? role : "unknown",
+            g_tp_runtime.rank,
+            g_tp_runtime.size,
+            (unsigned long long) g_tp_stats.calls,
+            (unsigned long long) g_tp_stats.elements,
+            (double) g_tp_stats.copy_us / 1000.0,
+            (double) g_tp_stats.wait_before_reduce_us / 1000.0,
+            (double) g_tp_stats.reduce_us / 1000.0,
+            (double) g_tp_stats.wait_after_reduce_us / 1000.0,
+            (double) total_us / 1000.0);
+
+    const char * base_prefix = prefix ? prefix : "ggml TP all-reduce:";
+    char slot_prefix[160];
+    const size_t base_len = strlen(base_prefix);
+    if (base_len > 0 && base_prefix[base_len - 1] == ':') {
+        snprintf(slot_prefix, sizeof(slot_prefix), "%.*s-slot:", (int) base_len - 1, base_prefix);
+    } else {
+        snprintf(slot_prefix, sizeof(slot_prefix), "%s-slot", base_prefix);
+    }
+
+    for (int slot = 0; slot < GGML_TP_PROFILE_SLOTS; ++slot) {
+        const ggml_tp_slot_stats & s = g_tp_slot_stats[slot];
+        if (s.calls == 0) {
+            continue;
+        }
+
+        fprintf(stderr,
+                "%s role=%s rank=%d/%d slot=%d layer=%d phase=%s calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms gap_before=%.3f ms\n",
+                slot_prefix,
+                role ? role : "unknown",
+                g_tp_runtime.rank,
+                g_tp_runtime.size,
+                slot,
+                slot / 2,
+                (slot % 2) == 0 ? "attn" : "ffn",
+                (unsigned long long) s.calls,
+                (unsigned long long) s.elements,
+                (double) s.copy_us / 1000.0,
+                (double) s.wait_before_reduce_us / 1000.0,
+                (double) s.reduce_us / 1000.0,
+                (double) s.wait_after_reduce_us / 1000.0,
+                (double) s.gap_before_us / 1000.0);
+    }
+}
+
+static void ggml_tp_barrier_wait() {
+    if (g_tp_runtime.size <= 1) {
+        return;
+    }
+
+    volatile int * count = &g_tp_runtime.state->barrier_count;
+    volatile int * generation = &g_tp_runtime.state->barrier_generation;
+    const int current_generation = __atomic_load_n(generation, __ATOMIC_ACQUIRE);
+    const int old = __sync_fetch_and_add(count, 1);
+
+    if (old + 1 == g_tp_runtime.size) {
+        __atomic_store_n(count, 0, __ATOMIC_RELEASE);
+        __sync_fetch_and_add(generation, 1);
+        return;
+    }
+
+    while (__atomic_load_n(generation, __ATOMIC_ACQUIRE) == current_generation) {
+#if defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
+}
+
+void ggml_compute_forward_all_reduce_sum(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int64_t nelem = ggml_nelements(src0);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(dst) == nelem);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const float * src = (const float *) src0->data;
+    float * out = (float *) dst->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t per_thread = (nelem + nth - 1) / nth;
+    const int64_t begin = per_thread * ith;
+    const int64_t end = MIN(begin + per_thread, nelem);
+
+    if (g_tp_runtime.size <= 1) {
+        if (begin < end) {
+            memcpy(out + begin, src + begin, (size_t) (end - begin) * sizeof(float));
+        }
+        return;
+    }
+
+    GGML_ASSERT(g_tp_runtime.rank >= 0 && g_tp_runtime.rank < g_tp_runtime.size);
+
+    const size_t slot_bytes = (size_t) nelem * sizeof(float);
+    GGML_ASSERT(slot_bytes * (size_t) g_tp_runtime.size <= g_tp_runtime.data_size);
+
+    float * shm = (float *) g_tp_runtime.data;
+    float * my_slot = (float *) (g_tp_runtime.data + slot_bytes * (size_t) g_tp_runtime.rank);
+
+    int64_t t0 = 0;
+    int64_t t1 = 0;
+    int64_t t2 = 0;
+    int64_t t3 = 0;
+    int64_t t4 = 0;
+    int64_t t5 = 0;
+
+    if (ith == 0) {
+        t0 = ggml_time_us();
+    }
+
+    if (begin < end) {
+        memcpy(my_slot + begin, src + begin, (size_t) (end - begin) * sizeof(float));
+    }
+
+    ggml_tp_thread_barrier(params);
+
+    if (ith == 0) {
+        t1 = ggml_time_us();
+        ggml_tp_barrier_wait();
+        t2 = ggml_time_us();
+    }
+
+    ggml_tp_thread_barrier(params);
+
+    if (ith == 0) {
+        t3 = ggml_time_us();
+    }
+
+    if (begin < end) {
+        ggml_tp_reduce_sum_f32(out, shm, g_tp_runtime.size, nelem, begin, end);
+    }
+
+    ggml_tp_thread_barrier(params);
+
+    if (ith == 0) {
+        t4 = ggml_time_us();
+        ggml_tp_barrier_wait();
+        t5 = ggml_time_us();
+
+        const uint64_t call_index = g_tp_stats.calls;
+        const int slot = call_index % GGML_TP_PROFILE_SLOTS;
+        const int64_t gap_before = g_tp_stats.last_end_us > 0 && t0 > g_tp_stats.last_end_us ?
+            t0 - g_tp_stats.last_end_us : 0;
+
+        g_tp_stats.calls += 1;
+        g_tp_stats.elements += (uint64_t) nelem;
+        g_tp_stats.copy_us += t1 - t0;
+        g_tp_stats.wait_before_reduce_us += t2 - t1;
+        g_tp_stats.reduce_us += t4 - t3;
+        g_tp_stats.wait_after_reduce_us += t5 - t4;
+        g_tp_stats.last_end_us = t5;
+
+        ggml_tp_slot_stats & slot_stats = g_tp_slot_stats[slot];
+        slot_stats.calls += 1;
+        slot_stats.elements += (uint64_t) nelem;
+        slot_stats.copy_us += t1 - t0;
+        slot_stats.wait_before_reduce_us += t2 - t1;
+        slot_stats.reduce_us += t4 - t3;
+        slot_stats.wait_after_reduce_us += t5 - t4;
+        slot_stats.gap_before_us += gap_before;
     }
 }
 

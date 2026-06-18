@@ -630,6 +630,11 @@ struct llama_model {
     enum llama_pipeline_brick_role pipeline_brick_role() const { return params.pipeline_brick_role; }
     int32_t pipeline_brick_layer_start() const { return params.pipeline_brick_layer_start; }
     int32_t pipeline_brick_layer_end() const { return params.pipeline_brick_layer_end; }
+    int32_t pipeline_brick_tp_rank() const { return params.pipeline_brick_tp_rank; }
+    int32_t pipeline_brick_tp_size() const { return params.pipeline_brick_tp_size; }
+    int32_t pipeline_brick_tp_q_heads() const { return pipeline_brick_tp_q_heads_local; }
+    int32_t pipeline_brick_tp_kv_heads() const { return pipeline_brick_tp_kv_heads_local; }
+    int32_t pipeline_brick_tp_ffn() const { return pipeline_brick_tp_ffn_local; }
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -654,6 +659,9 @@ struct llama_model {
 
 protected:
     llama_model_params params;
+    int32_t pipeline_brick_tp_q_heads_local = 0;
+    int32_t pipeline_brick_tp_kv_heads_local = 0;
+    int32_t pipeline_brick_tp_ffn_local = 0;
 
     struct impl;
     std::unique_ptr<impl> pimpl;

@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cerrno>
 #include <cmath>
@@ -13,6 +14,8 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <iomanip>
+#include <inttypes.h>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -31,6 +34,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+#include <infiniband/verbs.h>
+#endif
 
 namespace {
 
@@ -71,11 +78,19 @@ enum class doorbell_mode {
 enum class transport_kind {
     ntb_mw,
     cxl,
+    ib_rdma,
+    zni_rdma,
 };
 
 enum class hidden_dtype {
     f32,
     bf16,
+};
+
+enum class domain_mode {
+    none,
+    single,
+    dual,
 };
 
 struct pipeline_args {
@@ -88,10 +103,24 @@ struct pipeline_args {
     std::string numa_cpus;
     std::string head_numa;
     std::string tail_numa;
+    std::string stage_numa;
+    std::string up_tx_mw;
+    std::string up_rx_mw;
+    std::string down_tx_mw;
+    std::string down_rx_mw;
+    std::string up_rdmadev;
+    std::string down_rdmadev;
+    std::string up_rdma_local_info;
+    std::string up_rdma_peer_info;
+    std::string down_rdma_local_info;
+    std::string down_rdma_peer_info;
 
     llama_pipeline_brick_role role = LLAMA_PIPELINE_BRICK_ROLE_NONE;
     transport_kind transport = transport_kind::ntb_mw;
+    transport_kind up_transport = transport_kind::ntb_mw;
+    transport_kind down_transport = transport_kind::ntb_mw;
     doorbell_mode db_mode = doorbell_mode::write;
+    domain_mode domain = domain_mode::none;
 
     int32_t brick_id      = -1;
     int32_t peer_brick_id = -1;
@@ -101,11 +130,18 @@ struct pipeline_args {
     int32_t threads       = 8;
     int32_t n_predict     = 16;
     int32_t bricks        = 2;
+    int32_t stage_id      = -1;
+    int32_t stage_count   = 0;
     int32_t parallel      = 1;
     int32_t numa_tp       = 1;
+    int32_t tp_rank       = 0;
+    int32_t tp_size       = 1;
     int32_t prefill_chunk = 32;
     int32_t stream_kv_sink   = 16;
     int32_t stream_kv_recent = 128;
+    int32_t rdma_port = 1;
+    int32_t rdma_gid_index = 0;
+    int32_t rdma_mtu = 1024;
 
     hidden_dtype hidden_type = hidden_dtype::bf16;
 
@@ -166,8 +202,49 @@ static std::string role_name(llama_pipeline_brick_role role) {
     switch (role) {
         case LLAMA_PIPELINE_BRICK_ROLE_HEAD: return "head";
         case LLAMA_PIPELINE_BRICK_ROLE_TAIL: return "tail";
+        case LLAMA_PIPELINE_BRICK_ROLE_STAGE: return "stage";
         default: return "none";
     }
+}
+
+static std::string tp_stats_role_label(const pipeline_args & args) {
+    if (args.stage_id >= 0) {
+        return "stage" + std::to_string(args.stage_id);
+    }
+    return role_name(args.role);
+}
+
+static void exit_tp_child(const pipeline_args & args, int rc) {
+    const std::string label = tp_stats_role_label(args);
+    ggml_tp_print_stats("pipeline-brick TP all-reduce:", label.c_str());
+    fflush(stderr);
+    _exit(rc);
+}
+
+static std::string transport_name(transport_kind kind) {
+    switch (kind) {
+        case transport_kind::ntb_mw:   return "ntb-mw";
+        case transport_kind::cxl:      return "cxl";
+        case transport_kind::ib_rdma:  return "ib-rdma";
+        case transport_kind::zni_rdma: return "zni-rdma";
+    }
+    return "unknown";
+}
+
+static transport_kind parse_transport_kind(const std::string & value) {
+    if (value == "ntb-mw") {
+        return transport_kind::ntb_mw;
+    }
+    if (value == "cxl") {
+        return transport_kind::cxl;
+    }
+    if (value == "ib-rdma") {
+        return transport_kind::ib_rdma;
+    }
+    if (value == "zni-rdma") {
+        return transport_kind::zni_rdma;
+    }
+    throw std::runtime_error("unknown transport: " + value + " (supported: ntb-mw, cxl, ib-rdma, zni-rdma)");
 }
 
 static const char * hidden_dtype_name(hidden_dtype type) {
@@ -721,6 +798,589 @@ private:
     uint32_t rx_slot = 0;
 };
 
+struct rdma_peer_info {
+    uint32_t qpn = 0;
+    uint32_t psn = 0;
+    int gid_index = 0;
+    int port = 1;
+    std::array<uint8_t, 16> gid = {};
+};
+
+static std::string bytes_to_hex(const uint8_t * data, size_t size) {
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (size_t i = 0; i < size; ++i) {
+        out << std::setw(2) << (unsigned) data[i];
+    }
+    return out.str();
+}
+
+static std::array<uint8_t, 16> hex_to_gid(const std::string & value) {
+    if (value.size() != 32) {
+        throw std::runtime_error("RDMA gid must be 32 hex characters");
+    }
+    std::array<uint8_t, 16> out = {};
+    for (size_t i = 0; i < out.size(); ++i) {
+        const std::string byte = value.substr(i * 2, 2);
+        out[i] = (uint8_t) std::stoul(byte, nullptr, 16);
+    }
+    return out;
+}
+
+static void write_rdma_info_file(const std::string & path, const rdma_peer_info & info) {
+    if (path.empty()) {
+        return;
+    }
+    std::ofstream out(path);
+    if (!out) {
+        throw std::runtime_error("failed to write RDMA local info file: " + path);
+    }
+    out << "qpn=" << info.qpn << "\n";
+    out << "psn=" << info.psn << "\n";
+    out << "port=" << info.port << "\n";
+    out << "gid_index=" << info.gid_index << "\n";
+    out << "gid=" << bytes_to_hex(info.gid.data(), info.gid.size()) << "\n";
+}
+
+static rdma_peer_info read_rdma_info_file(const std::string & path) {
+    constexpr int max_attempts = 60000;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        rdma_peer_info info;
+        std::ifstream in(path);
+        if (in) {
+            try {
+                std::string line;
+                while (std::getline(in, line)) {
+                    const size_t eq = line.find('=');
+                    if (eq == std::string::npos) {
+                        continue;
+                    }
+                    const std::string key = line.substr(0, eq);
+                    const std::string value = line.substr(eq + 1);
+                    if (key == "qpn") {
+                        info.qpn = (uint32_t) std::stoul(value);
+                    } else if (key == "psn") {
+                        info.psn = (uint32_t) std::stoul(value);
+                    } else if (key == "port") {
+                        info.port = std::stoi(value);
+                    } else if (key == "gid_index") {
+                        info.gid_index = std::stoi(value);
+                    } else if (key == "gid") {
+                        info.gid = hex_to_gid(value);
+                    }
+                }
+                if (info.qpn != 0) {
+                    return info;
+                }
+            } catch (const std::exception &) {
+                // Peer info may be visible while the user or shell is still writing it.
+            }
+        }
+        if (attempt == 0) {
+            fprintf(stderr, "pipeline-brick rdma: waiting for peer info file %s\n", path.c_str());
+        }
+        sleep_us(10000);
+    }
+    throw std::runtime_error("timed out waiting for valid RDMA peer info file: " + path);
+}
+
+class ib_rdma_transport {
+public:
+    ib_rdma_transport() = default;
+    ib_rdma_transport(const ib_rdma_transport &) = delete;
+    ib_rdma_transport & operator=(const ib_rdma_transport &) = delete;
+
+    ib_rdma_transport(ib_rdma_transport && other) noexcept {
+        *this = std::move(other);
+    }
+
+    ib_rdma_transport & operator=(ib_rdma_transport && other) noexcept {
+        if (this != &other) {
+            cleanup();
+            move_from(other);
+        }
+        return *this;
+    }
+
+    ~ib_rdma_transport() {
+        cleanup();
+    }
+
+    static ib_rdma_transport open_transport(const pipeline_args & args, size_t max_payload_bytes, bool downstream) {
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+        ib_rdma_transport t;
+        t.max_message = sizeof(brick_packet_header) + max_payload_bytes;
+        t.rx_stride = align_up(t.max_message, 64);
+        t.rx_depth = PIPELINE_N_SLOTS;
+        t.tx_buf.resize(t.max_message);
+        t.rx_buf.resize(t.rx_stride * t.rx_depth);
+        t.dev_name = downstream ? args.down_rdmadev : args.up_rdmadev;
+        t.local_info_path = downstream ? args.down_rdma_local_info : args.up_rdma_local_info;
+        t.peer_info_path = downstream ? args.down_rdma_peer_info : args.up_rdma_peer_info;
+        t.ib_port = args.rdma_port;
+        t.gid_index = args.rdma_gid_index;
+        t.path_mtu = mtu_from_bytes(args.rdma_mtu);
+
+        t.open_device();
+        t.create_resources();
+        t.query_local_info();
+        write_rdma_info_file(t.local_info_path, t.local_info);
+        if (t.peer_info_path.empty()) {
+            throw std::runtime_error("RDMA requires --rdma-peer-info or --up/--down-rdma-peer-info");
+        }
+        rdma_peer_info peer = read_rdma_info_file(t.peer_info_path);
+        t.activate(peer);
+        t.post_all_recvs();
+
+        fprintf(stderr,
+                "pipeline-brick transport: ib-rdma dev=%s port=%d gid_index=%d qpn=%u peer_qpn=%u max_message=%zu\n",
+                t.dev_name.empty() ? "*" : t.dev_name.c_str(), t.ib_port, t.gid_index,
+                t.local_info.qpn, peer.qpn, t.max_message);
+        return t;
+#else
+        (void) args;
+        (void) max_payload_bytes;
+        (void) downstream;
+        throw std::runtime_error("ib-rdma transport was not built because libibverbs was not found");
+#endif
+    }
+
+    void send_hidden(int32_t seq_id, int32_t pos, int32_t n_embd, uint32_t flags, const float * payload) {
+        const uint64_t payload_bytes = (uint64_t) n_embd * sizeof(float);
+        send_raw(seq_id, pos, 1, n_embd, flags, payload, payload_bytes);
+    }
+
+    void send_hidden_payload(int32_t pos, int32_t n_tokens, int32_t n_embd, uint32_t flags, const void * payload, uint64_t payload_bytes) {
+        send_raw(-1, pos, n_tokens, n_embd, flags, payload, payload_bytes);
+    }
+
+    void send_token(int32_t seq_id, llama_token token) {
+        const token_payload payload = { seq_id, (int32_t) token };
+        send_raw(seq_id, -1, 0, 0, PIPELINE_FLAG_TOKEN, &payload, sizeof(payload));
+    }
+
+    void send_stop(int32_t seq_id, int32_t pos) {
+        send_raw(seq_id, pos, 0, 0, PIPELINE_FLAG_STOP, nullptr, 0);
+    }
+
+    recv_packet recv() {
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+        ibv_wc wc = {};
+        poll_cq(rcq, wc);
+        if (wc.opcode != IBV_WC_RECV || wc.byte_len < sizeof(brick_packet_header)) {
+            throw std::runtime_error("invalid RDMA receive completion");
+        }
+        const uint32_t slot = (uint32_t) wc.wr_id;
+        if (slot >= rx_depth) {
+            throw std::runtime_error("invalid RDMA receive slot");
+        }
+        const uint8_t * ptr = rx_buf.data() + rx_stride * slot;
+        const auto * header = reinterpret_cast<const brick_packet_header *>(ptr);
+        if (header->magic != PIPELINE_BRICK_MAGIC || header->version != PIPELINE_BRICK_VERSION) {
+            throw std::runtime_error("invalid pipeline-brick RDMA packet header");
+        }
+        if (sizeof(brick_packet_header) + header->payload_bytes != wc.byte_len) {
+            throw std::runtime_error("invalid pipeline-brick RDMA packet length");
+        }
+
+        recv_packet out;
+        out.header = *header;
+        if (out.header.payload_bytes > 0) {
+            out.payload.resize(out.header.payload_bytes);
+            memcpy(out.payload.data(), ptr + sizeof(brick_packet_header), out.payload.size());
+        }
+        post_recv(slot);
+        return out;
+#else
+        throw std::runtime_error("ib-rdma transport was not built because libibverbs was not found");
+#endif
+    }
+
+private:
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+    static ibv_mtu mtu_from_bytes(int bytes) {
+        if (bytes <= 256)  return IBV_MTU_256;
+        if (bytes <= 512)  return IBV_MTU_512;
+        if (bytes <= 1024) return IBV_MTU_1024;
+        if (bytes <= 2048) return IBV_MTU_2048;
+        return IBV_MTU_4096;
+    }
+
+    void open_device() {
+        int ndev = 0;
+        ibv_device ** devs = ibv_get_device_list(&ndev);
+        if (!devs || ndev == 0) {
+            throw std::runtime_error("ibv_get_device_list found no RDMA devices");
+        }
+        for (int i = 0; i < ndev; ++i) {
+            const char * name = ibv_get_device_name(devs[i]);
+            if (!dev_name.empty() && dev_name != name) {
+                continue;
+            }
+            ctx = ibv_open_device(devs[i]);
+            if (ctx) {
+                break;
+            }
+        }
+        ibv_free_device_list(devs);
+        if (!ctx) {
+            throw std::runtime_error("failed to open requested RDMA device");
+        }
+    }
+
+    void create_resources() {
+        pd = ibv_alloc_pd(ctx);
+        if (!pd) {
+            throw std::runtime_error("ibv_alloc_pd failed");
+        }
+        scq = ibv_create_cq(ctx, 16, nullptr, nullptr, 0);
+        rcq = ibv_create_cq(ctx, (int) rx_depth + 4, nullptr, nullptr, 0);
+        if (!scq || !rcq) {
+            throw std::runtime_error("ibv_create_cq failed");
+        }
+
+        ibv_qp_init_attr qia = {};
+        qia.send_cq = scq;
+        qia.recv_cq = rcq;
+        qia.qp_type = IBV_QPT_RC;
+        qia.cap.max_send_wr = 16;
+        qia.cap.max_recv_wr = rx_depth + 4;
+        qia.cap.max_send_sge = 1;
+        qia.cap.max_recv_sge = 1;
+        qia.cap.max_inline_data = 256;
+        qp = ibv_create_qp(pd, &qia);
+        if (!qp) {
+            throw std::runtime_error("ibv_create_qp failed");
+        }
+        max_inline = qia.cap.max_inline_data;
+
+        tx_mr = ibv_reg_mr(pd, tx_buf.data(), tx_buf.size(), IBV_ACCESS_LOCAL_WRITE);
+        rx_mr = ibv_reg_mr(pd, rx_buf.data(), rx_buf.size(), IBV_ACCESS_LOCAL_WRITE);
+        if (!tx_mr || !rx_mr) {
+            throw std::runtime_error("ibv_reg_mr failed");
+        }
+    }
+
+    void query_local_info() {
+        ibv_port_attr port_attr = {};
+        if (ibv_query_port(ctx, ib_port, &port_attr) != 0 || port_attr.state != IBV_PORT_ACTIVE) {
+            throw std::runtime_error("RDMA port is not active");
+        }
+        ibv_gid gid = {};
+        if (ibv_query_gid(ctx, ib_port, gid_index, &gid) != 0) {
+            throw std::runtime_error("ibv_query_gid failed");
+        }
+        local_info.qpn = qp->qp_num;
+        local_info.psn = qp->qp_num & 0xffffff;
+        local_info.port = ib_port;
+        local_info.gid_index = gid_index;
+        memcpy(local_info.gid.data(), &gid, local_info.gid.size());
+    }
+
+    void activate(const rdma_peer_info & peer) {
+        {
+            ibv_qp_attr attr = {};
+            attr.qp_state = IBV_QPS_INIT;
+            attr.port_num = ib_port;
+            attr.pkey_index = 0;
+            attr.qp_access_flags = 0;
+            if (ibv_modify_qp(qp, &attr,
+                        IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
+                throw std::runtime_error("ibv_modify_qp INIT failed");
+            }
+        }
+        {
+            ibv_qp_attr attr = {};
+            attr.qp_state = IBV_QPS_RTR;
+            attr.path_mtu = path_mtu;
+            attr.dest_qp_num = peer.qpn;
+            attr.rq_psn = peer.psn;
+            attr.max_dest_rd_atomic = 1;
+            attr.min_rnr_timer = 12;
+            attr.ah_attr.is_global = 1;
+            memcpy(&attr.ah_attr.grh.dgid, peer.gid.data(), peer.gid.size());
+            attr.ah_attr.grh.sgid_index = gid_index;
+            attr.ah_attr.grh.hop_limit = 1;
+            attr.ah_attr.dlid = 0;
+            attr.ah_attr.sl = 0;
+            attr.ah_attr.src_path_bits = 0;
+            attr.ah_attr.port_num = ib_port;
+            if (ibv_modify_qp(qp, &attr,
+                        IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                        IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER) != 0) {
+                throw std::runtime_error("ibv_modify_qp RTR failed");
+            }
+        }
+        {
+            ibv_qp_attr attr = {};
+            attr.qp_state = IBV_QPS_RTS;
+            attr.timeout = 14;
+            attr.retry_cnt = 7;
+            attr.rnr_retry = 7;
+            attr.sq_psn = local_info.psn;
+            attr.max_rd_atomic = 1;
+            if (ibv_modify_qp(qp, &attr,
+                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                        IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) != 0) {
+                throw std::runtime_error("ibv_modify_qp RTS failed");
+            }
+        }
+    }
+
+    void post_all_recvs() {
+        for (uint32_t i = 0; i < rx_depth; ++i) {
+            post_recv(i);
+        }
+    }
+
+    void post_recv(uint32_t slot) {
+        ibv_sge sge = {};
+        sge.addr = (uintptr_t) (rx_buf.data() + rx_stride * slot);
+        sge.length = (uint32_t) rx_stride;
+        sge.lkey = rx_mr->lkey;
+
+        ibv_recv_wr wr = {};
+        ibv_recv_wr * bad = nullptr;
+        wr.wr_id = slot;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        if (ibv_post_recv(qp, &wr, &bad) != 0) {
+            throw std::runtime_error("ibv_post_recv failed");
+        }
+    }
+
+    void poll_cq(ibv_cq * cq, ibv_wc & wc) {
+        while (true) {
+            const int n = ibv_poll_cq(cq, 1, &wc);
+            if (n < 0) {
+                throw std::runtime_error("ibv_poll_cq failed");
+            }
+            if (n == 0) {
+                sleep_us(50);
+                continue;
+            }
+            if (wc.status != IBV_WC_SUCCESS) {
+                throw std::runtime_error(std::string("RDMA completion failed: ") + ibv_wc_status_str(wc.status));
+            }
+            return;
+        }
+    }
+#endif
+
+    void send_raw(int32_t seq_id, int32_t pos, int32_t n_tokens, int32_t n_embd, uint32_t flags, const void * payload, uint64_t payload_bytes) {
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+        const size_t bytes = sizeof(brick_packet_header) + (size_t) payload_bytes;
+        if (bytes > tx_buf.size()) {
+            throw std::runtime_error("pipeline-brick RDMA payload exceeds message buffer");
+        }
+        auto * header = reinterpret_cast<brick_packet_header *>(tx_buf.data());
+        header->magic = PIPELINE_BRICK_MAGIC;
+        header->version = PIPELINE_BRICK_VERSION;
+        header->slot = 0;
+        header->flags = flags;
+        header->n_tokens = n_tokens;
+        header->n_embd = n_embd;
+        header->pos = pos;
+        header->seq_id = seq_id;
+        header->payload_bytes = payload_bytes;
+        if (payload_bytes > 0) {
+            memcpy(tx_buf.data() + sizeof(brick_packet_header), payload, payload_bytes);
+        }
+
+        ibv_sge sge = {};
+        sge.addr = (uintptr_t) tx_buf.data();
+        sge.length = (uint32_t) bytes;
+        sge.lkey = tx_mr->lkey;
+
+        ibv_send_wr wr = {};
+        ibv_send_wr * bad = nullptr;
+        wr.wr_id = 0;
+        wr.opcode = IBV_WR_SEND;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        if (bytes <= max_inline) {
+            wr.send_flags |= IBV_SEND_INLINE;
+        }
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+
+        if (ibv_post_send(qp, &wr, &bad) != 0) {
+            throw std::runtime_error("ibv_post_send failed");
+        }
+        ibv_wc wc = {};
+        poll_cq(scq, wc);
+#else
+        (void) seq_id;
+        (void) pos;
+        (void) n_tokens;
+        (void) n_embd;
+        (void) flags;
+        (void) payload;
+        (void) payload_bytes;
+        throw std::runtime_error("ib-rdma transport was not built because libibverbs was not found");
+#endif
+    }
+
+    void cleanup() {
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+        if (tx_mr) ibv_dereg_mr(tx_mr);
+        if (rx_mr) ibv_dereg_mr(rx_mr);
+        if (qp) ibv_destroy_qp(qp);
+        if (scq) ibv_destroy_cq(scq);
+        if (rcq) ibv_destroy_cq(rcq);
+        if (pd) ibv_dealloc_pd(pd);
+        if (ctx) ibv_close_device(ctx);
+        tx_mr = nullptr;
+        rx_mr = nullptr;
+        qp = nullptr;
+        scq = nullptr;
+        rcq = nullptr;
+        pd = nullptr;
+        ctx = nullptr;
+#endif
+    }
+
+    void move_from(ib_rdma_transport & other) {
+        max_message = other.max_message;
+        rx_stride = other.rx_stride;
+        rx_depth = other.rx_depth;
+        ib_port = other.ib_port;
+        gid_index = other.gid_index;
+        dev_name = std::move(other.dev_name);
+        local_info_path = std::move(other.local_info_path);
+        peer_info_path = std::move(other.peer_info_path);
+        tx_buf = std::move(other.tx_buf);
+        rx_buf = std::move(other.rx_buf);
+        local_info = other.local_info;
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+        ctx = other.ctx;
+        pd = other.pd;
+        scq = other.scq;
+        rcq = other.rcq;
+        qp = other.qp;
+        tx_mr = other.tx_mr;
+        rx_mr = other.rx_mr;
+        path_mtu = other.path_mtu;
+        max_inline = other.max_inline;
+        other.ctx = nullptr;
+        other.pd = nullptr;
+        other.scq = nullptr;
+        other.rcq = nullptr;
+        other.qp = nullptr;
+        other.tx_mr = nullptr;
+        other.rx_mr = nullptr;
+#endif
+    }
+
+    size_t max_message = 0;
+    size_t rx_stride = 0;
+    uint32_t rx_depth = 0;
+    int ib_port = 1;
+    int gid_index = 0;
+    std::string dev_name;
+    std::string local_info_path;
+    std::string peer_info_path;
+    std::vector<uint8_t> tx_buf;
+    std::vector<uint8_t> rx_buf;
+    rdma_peer_info local_info;
+#if defined(LLAMA_PIPELINE_BRICK_IBVERBS)
+    ibv_context * ctx = nullptr;
+    ibv_pd * pd = nullptr;
+    ibv_cq * scq = nullptr;
+    ibv_cq * rcq = nullptr;
+    ibv_qp * qp = nullptr;
+    ibv_mr * tx_mr = nullptr;
+    ibv_mr * rx_mr = nullptr;
+    ibv_mtu path_mtu = IBV_MTU_1024;
+    uint32_t max_inline = 0;
+#endif
+};
+
+class zni_transport {
+public:
+    static zni_transport open_transport(const pipeline_args &, size_t, bool) {
+        throw std::runtime_error("zni-rdma transport requires the ZNI SDK adapter; this build only provides the common transport interface");
+    }
+
+    void send_hidden(int32_t, int32_t, int32_t, uint32_t, const float *) {
+        throw std::runtime_error("zni-rdma transport is not available in this build");
+    }
+
+    void send_hidden_payload(int32_t, int32_t, int32_t, uint32_t, const void *, uint64_t) {
+        throw std::runtime_error("zni-rdma transport is not available in this build");
+    }
+
+    void send_token(int32_t, llama_token) {
+        throw std::runtime_error("zni-rdma transport is not available in this build");
+    }
+
+    void send_stop(int32_t, int32_t) {
+        throw std::runtime_error("zni-rdma transport is not available in this build");
+    }
+
+    recv_packet recv() {
+        throw std::runtime_error("zni-rdma transport is not available in this build");
+    }
+};
+
+class transport_box {
+public:
+    template<typename T>
+    explicit transport_box(T && impl) : self(new model<T>(std::move(impl))) {}
+
+    void send_hidden(int32_t seq_id, int32_t pos, int32_t n_embd, uint32_t flags, const float * payload) {
+        self->send_hidden(seq_id, pos, n_embd, flags, payload);
+    }
+
+    void send_hidden_payload(int32_t pos, int32_t n_tokens, int32_t n_embd, uint32_t flags, const void * payload, uint64_t payload_bytes) {
+        self->send_hidden_payload(pos, n_tokens, n_embd, flags, payload, payload_bytes);
+    }
+
+    void send_token(int32_t seq_id, llama_token token) {
+        self->send_token(seq_id, token);
+    }
+
+    void send_stop(int32_t seq_id, int32_t pos) {
+        self->send_stop(seq_id, pos);
+    }
+
+    recv_packet recv() {
+        return self->recv();
+    }
+
+private:
+    struct iface {
+        virtual ~iface() = default;
+        virtual void send_hidden(int32_t, int32_t, int32_t, uint32_t, const float *) = 0;
+        virtual void send_hidden_payload(int32_t, int32_t, int32_t, uint32_t, const void *, uint64_t) = 0;
+        virtual void send_token(int32_t, llama_token) = 0;
+        virtual void send_stop(int32_t, int32_t) = 0;
+        virtual recv_packet recv() = 0;
+    };
+
+    template<typename T>
+    struct model : iface {
+        explicit model(T && impl) : impl(std::move(impl)) {}
+        void send_hidden(int32_t seq_id, int32_t pos, int32_t n_embd, uint32_t flags, const float * payload) override {
+            impl.send_hidden(seq_id, pos, n_embd, flags, payload);
+        }
+        void send_hidden_payload(int32_t pos, int32_t n_tokens, int32_t n_embd, uint32_t flags, const void * payload, uint64_t payload_bytes) override {
+            impl.send_hidden_payload(pos, n_tokens, n_embd, flags, payload, payload_bytes);
+        }
+        void send_token(int32_t seq_id, llama_token token) override {
+            impl.send_token(seq_id, token);
+        }
+        void send_stop(int32_t seq_id, int32_t pos) override {
+            impl.send_stop(seq_id, pos);
+        }
+        recv_packet recv() override {
+            return impl.recv();
+        }
+        T impl;
+    };
+
+    std::unique_ptr<iface> self;
+};
+
 static bool contains(const char * text, const char * needle) {
     return strstr(text, needle) != nullptr;
 }
@@ -748,14 +1408,27 @@ static void pipeline_brick_log_callback(ggml_log_level level, const char * text,
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --single-system --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
+            "usage: %s --domain-mode single --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
+            "          --parallel N --head-numa 0-3 --tail-numa 4-7 [--tp-size 1|2|4]\n"
+            "       %s --domain-mode dual --stage-id N --stage-count 4 --model PATH --ctx-size N --threads N\n"
+            "          --parallel N --numa-cpus CPU-RANGES --up-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
+            "          --down-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
+            "       %s --single-system --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
             "          --parallel N --head-numa 0-3 --tail-numa 4-7 [--prefill-chunk N]\n"
             "          [--hidden-dtype bf16|f32] [--stream-kv]\n"
             "          [--stream-kv-sink N] [--stream-kv-recent N]\n"
-            "          [--quiet] [--verbose]\n"
+            "          [--tp-size N] [--quiet] [--verbose]\n"
+            "       %s --single-system --stage-count 4 --stage-numa '0-1;2-3;4-5;6-7'\n"
+            "          --transport ntb-mw|cxl --model PATH --prompt TEXT --ctx-size N --threads N\n"
+            "          --n-predict N --parallel N [--stream-kv] [--quiet] [--verbose]\n"
+            "       %s --hardware --stage-id N --stage-count 4 --model PATH --ctx-size N --threads N\n"
+            "          --parallel N --numa-cpus CPU-RANGES --up-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
+            "          --down-transport ntb-mw|cxl|ib-rdma|zni-rdma [--up-tx-mw PATH --up-rx-mw PATH]\n"
+            "          [--down-tx-mw PATH --down-rx-mw PATH] [--up-rdma-local-info PATH --up-rdma-peer-info PATH]\n"
+            "          [--down-rdma-local-info PATH --down-rdma-peer-info PATH] [--rdma-dev DEV]\n"
             "       %s --hardware --role head|tail --model PATH --ctx-size N --threads N --n-predict N --bricks 2\n"
             "          --brick-id N --peer-brick-id N --layer-start N --layer-end N --parallel N\n"
-            "          --numa-tp N --numa-cpus CPU-RANGES --transport ntb-mw|cxl\n"
+            "          --numa-tp N --tp-size N --numa-cpus CPU-RANGES --transport ntb-mw|cxl\n"
             "          --tx-mw PATH --rx-mw PATH [--tx-doorbell PATH --rx-doorbell PATH]\n"
             "          [--doorbell-mode write|poll|ioctl] [--head-numa NODES --tail-numa NODES]\n"
             "          [--prompt TEXT]\n"
@@ -763,7 +1436,7 @@ static void print_usage(const char * prog) {
             "          [--stream-kv-sink N] [--stream-kv-recent N] [--quiet] [--verbose]\n"
             "       %s --self-test-ntb --role head|tail --brick-id N --peer-brick-id N\n"
             "          --transport ntb-mw --tx-mw PATH --rx-mw PATH\n",
-            prog, prog, prog);
+            prog, prog, prog, prog, prog, prog, prog);
 }
 
 static doorbell_mode parse_doorbell_mode(const std::string & value) {
@@ -786,7 +1459,20 @@ static llama_pipeline_brick_role parse_role(const std::string & value) {
     if (value == "tail") {
         return LLAMA_PIPELINE_BRICK_ROLE_TAIL;
     }
+    if (value == "stage") {
+        return LLAMA_PIPELINE_BRICK_ROLE_STAGE;
+    }
     throw std::runtime_error("unknown --role: " + value);
+}
+
+static domain_mode parse_domain_mode(const std::string & value) {
+    if (value == "single") {
+        return domain_mode::single;
+    }
+    if (value == "dual") {
+        return domain_mode::dual;
+    }
+    throw std::runtime_error("unknown --domain-mode: " + value + " (supported: single, dual)");
 }
 
 static pipeline_args parse_args(int argc, char ** argv) {
@@ -806,6 +1492,8 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.single_system = true;
         } else if (key == "--self-test-ntb") {
             args.self_test_ntb = true;
+        } else if (key == "--domain-mode") {
+            args.domain = parse_domain_mode(need_value(key.c_str()));
         } else if (key == "--verbose") {
             args.verbose = true;
         } else if (key == "--quiet") {
@@ -832,6 +1520,10 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.n_predict = std::stoi(need_value(key.c_str()));
         } else if (key == "--bricks") {
             args.bricks = std::stoi(need_value(key.c_str()));
+        } else if (key == "--stage-id") {
+            args.stage_id = std::stoi(need_value(key.c_str()));
+        } else if (key == "--stage-count") {
+            args.stage_count = std::stoi(need_value(key.c_str()));
         } else if (key == "--parallel") {
             args.parallel = std::stoi(need_value(key.c_str()));
         } else if (key == "--prefill-chunk") {
@@ -862,25 +1554,63 @@ static pipeline_args parse_args(int argc, char ** argv) {
             throw std::runtime_error("--ema-sync has been removed from pipeline-brick; use --stream-kv");
         } else if (key == "--numa-tp") {
             args.numa_tp = std::stoi(need_value(key.c_str()));
+        } else if (key == "--tp-size") {
+            args.tp_size = std::stoi(need_value(key.c_str()));
         } else if (key == "--numa-cpus") {
             args.numa_cpus = need_value(key.c_str());
         } else if (key == "--head-numa") {
             args.head_numa = need_value(key.c_str());
         } else if (key == "--tail-numa") {
             args.tail_numa = need_value(key.c_str());
+        } else if (key == "--stage-numa") {
+            args.stage_numa = need_value(key.c_str());
         } else if (key == "--transport") {
-            const std::string value = need_value(key.c_str());
-            if (value == "ntb-mw") {
-                args.transport = transport_kind::ntb_mw;
-            } else if (value == "cxl") {
-                args.transport = transport_kind::cxl;
-            } else {
-                throw std::runtime_error("unknown --transport: " + value + " (supported: ntb-mw, cxl)");
-            }
+            args.transport = parse_transport_kind(need_value(key.c_str()));
+            args.up_transport = args.transport;
+            args.down_transport = args.transport;
+        } else if (key == "--up-transport") {
+            args.up_transport = parse_transport_kind(need_value(key.c_str()));
+        } else if (key == "--down-transport") {
+            args.down_transport = parse_transport_kind(need_value(key.c_str()));
         } else if (key == "--tx-mw") {
             args.tx_mw = need_value(key.c_str());
         } else if (key == "--rx-mw") {
             args.rx_mw = need_value(key.c_str());
+        } else if (key == "--up-tx-mw") {
+            args.up_tx_mw = need_value(key.c_str());
+        } else if (key == "--up-rx-mw") {
+            args.up_rx_mw = need_value(key.c_str());
+        } else if (key == "--down-tx-mw") {
+            args.down_tx_mw = need_value(key.c_str());
+        } else if (key == "--down-rx-mw") {
+            args.down_rx_mw = need_value(key.c_str());
+        } else if (key == "--rdma-dev") {
+            args.up_rdmadev = need_value(key.c_str());
+            args.down_rdmadev = args.up_rdmadev;
+        } else if (key == "--up-rdma-dev") {
+            args.up_rdmadev = need_value(key.c_str());
+        } else if (key == "--down-rdma-dev") {
+            args.down_rdmadev = need_value(key.c_str());
+        } else if (key == "--rdma-port") {
+            args.rdma_port = std::stoi(need_value(key.c_str()));
+        } else if (key == "--rdma-gid-index") {
+            args.rdma_gid_index = std::stoi(need_value(key.c_str()));
+        } else if (key == "--rdma-mtu") {
+            args.rdma_mtu = std::stoi(need_value(key.c_str()));
+        } else if (key == "--rdma-local-info") {
+            args.up_rdma_local_info = need_value(key.c_str());
+            args.down_rdma_local_info = args.up_rdma_local_info;
+        } else if (key == "--rdma-peer-info") {
+            args.up_rdma_peer_info = need_value(key.c_str());
+            args.down_rdma_peer_info = args.up_rdma_peer_info;
+        } else if (key == "--up-rdma-local-info") {
+            args.up_rdma_local_info = need_value(key.c_str());
+        } else if (key == "--up-rdma-peer-info") {
+            args.up_rdma_peer_info = need_value(key.c_str());
+        } else if (key == "--down-rdma-local-info") {
+            args.down_rdma_local_info = need_value(key.c_str());
+        } else if (key == "--down-rdma-peer-info") {
+            args.down_rdma_peer_info = need_value(key.c_str());
         } else if (key == "--tx-doorbell") {
             args.tx_doorbell = need_value(key.c_str());
         } else if (key == "--rx-doorbell") {
@@ -925,6 +1655,55 @@ static std::vector<int> parse_cpu_list(const std::string & spec) {
     return cpus;
 }
 
+static std::vector<int> parse_cpu_list_ordered(const std::string & spec) {
+    std::vector<int> cpus;
+    size_t start = 0;
+    while (start < spec.size()) {
+        size_t end = spec.find(',', start);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        std::string part = spec.substr(start, end - start);
+        if (!part.empty()) {
+            size_t dash = part.find('-');
+            if (dash == std::string::npos) {
+                cpus.push_back(std::stoi(part));
+            } else {
+                int first = std::stoi(part.substr(0, dash));
+                int last = std::stoi(part.substr(dash + 1));
+                if (last < first) {
+                    throw std::runtime_error("invalid CPU range: " + part);
+                }
+                for (int cpu = first; cpu <= last; ++cpu) {
+                    cpus.push_back(cpu);
+                }
+            }
+        }
+        start = end + 1;
+    }
+    return cpus;
+}
+
+static std::vector<std::string> split_stage_specs(const std::string & spec) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= spec.size()) {
+        size_t end = spec.find(';', start);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        std::string part = spec.substr(start, end - start);
+        if (!part.empty()) {
+            out.push_back(part);
+        }
+        if (end == spec.size()) {
+            break;
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
 static std::string join_cpu_list(const std::vector<int> & cpus) {
     std::ostringstream out;
     for (size_t i = 0; i < cpus.size(); ++i) {
@@ -962,6 +1741,35 @@ static std::string cpus_for_numa_nodes(const std::string & node_spec) {
         throw std::runtime_error("NUMA node spec did not resolve to any CPUs: " + node_spec);
     }
     return join_cpu_list(cpus);
+}
+
+static std::vector<int> numa_nodes_for_cpu_spec(const std::string & cpu_spec) {
+    std::vector<int> cpus = parse_cpu_list(cpu_spec);
+    std::vector<int> nodes;
+
+    if (cpus.empty()) {
+        return nodes;
+    }
+
+    for (int node = 0; node < 1024; ++node) {
+        const std::string path = "/sys/devices/system/node/node" + std::to_string(node) + "/cpulist";
+        std::ifstream in(path);
+        if (!in) {
+            break;
+        }
+
+        std::string line;
+        std::getline(in, line);
+        std::vector<int> node_cpus = parse_cpu_list(line);
+        for (int cpu : cpus) {
+            if (std::find(node_cpus.begin(), node_cpus.end(), cpu) != node_cpus.end()) {
+                nodes.push_back(node);
+                break;
+            }
+        }
+    }
+
+    return nodes;
 }
 
 static std::vector<unsigned long> make_nodemask(const std::vector<int> & nodes) {
@@ -1038,12 +1846,137 @@ static void bind_to_cpus(const std::string & cpu_spec) {
     fprintf(stderr, "pipeline-brick numa: bound process to %zu CPUs from '%s'\n", cpus.size(), cpu_spec.c_str());
 }
 
+static void init_ggml_numa_for_binding(const pipeline_args & args) {
+    std::vector<int> nodes = numa_nodes_for_cpu_spec(args.numa_cpus);
+    if (nodes.size() == 1) {
+        fprintf(stderr, "pipeline-brick numa: skip ggml NUMA init for single-node CPU binding node=%d\n", nodes[0]);
+        return;
+    }
+
+    llama_numa_init(GGML_NUMA_STRATEGY_NUMACTL);
+}
+
+static bool parse_numa_maps_node_token(const std::string & token, int & node, uint64_t & pages) {
+    if (token.size() < 4 || token[0] != 'N') {
+        return false;
+    }
+
+    size_t pos = 1;
+    while (pos < token.size() && token[pos] >= '0' && token[pos] <= '9') {
+        ++pos;
+    }
+    if (pos == 1 || pos >= token.size() || token[pos] != '=') {
+        return false;
+    }
+
+    node = std::stoi(token.substr(1, pos - 1));
+    pages = std::stoull(token.substr(pos + 1));
+    return true;
+}
+
+static std::vector<uint64_t> read_numa_maps_pages() {
+    std::ifstream in("/proc/self/numa_maps");
+    std::vector<uint64_t> pages_by_node;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream iss(line);
+        std::string token;
+        while (iss >> token) {
+            int node = -1;
+            uint64_t pages = 0;
+            if (!parse_numa_maps_node_token(token, node, pages)) {
+                continue;
+            }
+            if (node >= (int) pages_by_node.size()) {
+                pages_by_node.resize((size_t) node + 1, 0);
+            }
+            pages_by_node[(size_t) node] += pages;
+        }
+    }
+    return pages_by_node;
+}
+
+static void print_numa_pages_line(
+        const pipeline_args & args,
+        const char * kind,
+        const std::vector<uint64_t> & pages_by_node,
+        const std::vector<uint64_t> * before = nullptr) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    uint64_t total_pages = 0;
+    fprintf(stderr,
+            "pipeline-brick numa-maps: role=%s rank=%d/%d pid=%ld tp=tp%d kind=%s model=%s pages",
+            role_name(args.role).c_str(), args.tp_rank, args.tp_size, (long) getpid(),
+            args.tp_rank, kind, args.model.c_str());
+
+    const size_t n_nodes = before != nullptr ? std::max(pages_by_node.size(), before->size()) : pages_by_node.size();
+    for (size_t i = 0; i < n_nodes; ++i) {
+        int64_t value = i < pages_by_node.size() ? (int64_t) pages_by_node[i] : 0;
+        if (before != nullptr) {
+            const uint64_t prev = i < before->size() ? (*before)[i] : 0;
+            value -= (int64_t) prev;
+        }
+        if (value == 0) {
+            continue;
+        }
+        total_pages += value > 0 ? (uint64_t) value : 0;
+        fprintf(stderr, " N%zu=%" PRId64, i, value);
+    }
+
+    const double mib = page_size > 0 ? (double) total_pages * (double) page_size / 1048576.0 : 0.0;
+    fprintf(stderr, " total=%" PRIu64 " total_mib=%.1f\n", total_pages, mib);
+}
+
+static bool stage_mode_enabled(const pipeline_args & args);
+
+static void apply_domain_mode_defaults(pipeline_args & args) {
+    switch (args.domain) {
+        case domain_mode::none:
+            break;
+        case domain_mode::single:
+            args.single_system = true;
+            break;
+        case domain_mode::dual:
+            args.hardware = true;
+            if (args.stage_count == 0) {
+                args.stage_count = 4;
+            }
+            break;
+    }
+}
+
 static void validate_args(const pipeline_args & args) {
     if (!args.hardware && !args.single_system && !args.self_test_ntb) {
         throw std::runtime_error("real-machine build requires --hardware, --single-system, or --self-test-ntb");
     }
-    if (args.bricks != 2) {
+    const bool stage_mode = stage_mode_enabled(args);
+    if (args.domain == domain_mode::single) {
+        if (args.hardware || args.self_test_ntb) {
+            throw std::runtime_error("--domain-mode single cannot be combined with --hardware or --self-test-ntb");
+        }
+        if (args.stage_id >= 0 || args.stage_count != 0 || args.role == LLAMA_PIPELINE_BRICK_ROLE_STAGE ||
+                !args.stage_numa.empty()) {
+            throw std::runtime_error("--domain-mode single uses the two-stage head/tail path and cannot be combined with stage options");
+        }
+    }
+    if (args.domain == domain_mode::dual) {
+        if (args.single_system || args.self_test_ntb) {
+            throw std::runtime_error("--domain-mode dual cannot be combined with --single-system or --self-test-ntb");
+        }
+        if (args.stage_count != 4) {
+            throw std::runtime_error("--domain-mode dual requires --stage-count 4");
+        }
+        if (args.stage_id < 0) {
+            throw std::runtime_error("--domain-mode dual requires --stage-id N");
+        }
+    }
+    if (!stage_mode && args.bricks != 2) {
         throw std::runtime_error("pipeline-brick requires --bricks 2");
+    }
+    if (args.tp_size <= 0) {
+        throw std::runtime_error("--tp-size must be positive");
+    }
+    if (args.tp_size != 1 && args.tp_size != 2 && args.tp_size != 4) {
+        throw std::runtime_error("pipeline-brick TP prototype supports only --tp-size 1, 2, or 4");
     }
     if (args.stream_kv) {
         if (args.stream_kv_sink < 0 || args.stream_kv_recent < 0) {
@@ -1060,7 +1993,10 @@ static void validate_args(const pipeline_args & args) {
         if (args.prompt.empty()) {
             throw std::runtime_error("--prompt is required");
         }
-        if (args.head_numa.empty() || args.tail_numa.empty()) {
+        if (stage_mode && args.stage_numa.empty()) {
+            throw std::runtime_error("--stage-numa is required for single-system stage mode");
+        }
+        if (!stage_mode && (args.head_numa.empty() || args.tail_numa.empty())) {
             throw std::runtime_error("--head-numa and --tail-numa are required for --single-system");
         }
         if (args.parallel <= 0) {
@@ -1074,10 +2010,10 @@ static void validate_args(const pipeline_args & args) {
         }
         return;
     }
-    if (args.role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
+    if (!stage_mode && args.role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
         throw std::runtime_error("--role head|tail is required");
     }
-    if (args.brick_id < 0 || args.peer_brick_id < 0) {
+    if (!stage_mode && (args.brick_id < 0 || args.peer_brick_id < 0)) {
         throw std::runtime_error("--brick-id and --peer-brick-id are required");
     }
     if (args.parallel <= 0) {
@@ -1089,39 +2025,68 @@ static void validate_args(const pipeline_args & args) {
     if (args.prefill_chunk <= 0) {
         throw std::runtime_error("--prefill-chunk must be positive");
     }
-    if (args.db_mode == doorbell_mode::write && (args.tx_doorbell.empty() || args.rx_doorbell.empty())) {
+    if (stage_mode && args.tp_size > 1 && args.stage_numa.empty()) {
+        throw std::runtime_error("--stage-numa is required for stage mode with --tp-size > 1");
+    }
+    if (!stage_mode && args.transport == transport_kind::ntb_mw &&
+            args.db_mode == doorbell_mode::write && (args.tx_doorbell.empty() || args.rx_doorbell.empty())) {
         throw std::runtime_error("--tx-doorbell and --rx-doorbell are required for --doorbell-mode write");
+    }
+    if (stage_mode && args.db_mode == doorbell_mode::write &&
+            (args.up_transport == transport_kind::ntb_mw || args.down_transport == transport_kind::ntb_mw)) {
+        throw std::runtime_error("stage mode with ntb-mw requires --doorbell-mode poll");
     }
     if (!args.self_test_ntb) {
         if (args.model.empty()) {
             throw std::runtime_error("--model is required");
         }
-        if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && args.prompt.empty()) {
+        if ((!stage_mode && args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && args.prompt.empty()) ||
+                (stage_mode && args.stage_id == 0 && args.prompt.empty())) {
             throw std::runtime_error("--prompt is required on head");
         }
         if (args.n_predict <= 0) {
             throw std::runtime_error("--n-predict must be positive");
         }
-        if (args.layer_start < 0 || args.layer_end <= args.layer_start || args.layer_end > QWEN3_4B_N_LAYER) {
+        const bool layer_range_defaulted = stage_mode && args.layer_start < 0 && args.layer_end < 0;
+        if (!layer_range_defaulted &&
+                (args.layer_start < 0 || args.layer_end <= args.layer_start || args.layer_end > QWEN3_4B_N_LAYER)) {
             throw std::runtime_error("invalid --layer-start/--layer-end");
         }
-        if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && (args.layer_start != 0 || args.layer_end != QWEN3_4B_SPLIT_LAYER)) {
-            throw std::runtime_error("head must use --layer-start 0 --layer-end 18 for Qwen3-4B");
-        }
-        if (args.role == LLAMA_PIPELINE_BRICK_ROLE_TAIL && (args.layer_start != QWEN3_4B_SPLIT_LAYER || args.layer_end != QWEN3_4B_N_LAYER)) {
-            throw std::runtime_error("tail must use --layer-start 18 --layer-end 36 for Qwen3-4B");
+        if (!stage_mode) {
+            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && (args.layer_start != 0 || args.layer_end != QWEN3_4B_SPLIT_LAYER)) {
+                throw std::runtime_error("head must use --layer-start 0 --layer-end 18 for Qwen3-4B");
+            }
+            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_TAIL && (args.layer_start != QWEN3_4B_SPLIT_LAYER || args.layer_end != QWEN3_4B_N_LAYER)) {
+                throw std::runtime_error("tail must use --layer-start 18 --layer-end 36 for Qwen3-4B");
+            }
         }
     }
 }
 
 static llama_model * load_brick_model(const pipeline_args & args) {
+    std::vector<uint64_t> numa_pages_before;
+    if (args.tp_size > 1) {
+        numa_pages_before = read_numa_maps_pages();
+    }
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
     mparams.pipeline_brick_enabled = true;
     mparams.pipeline_brick_role = args.role;
     mparams.pipeline_brick_layer_start = args.layer_start;
     mparams.pipeline_brick_layer_end = args.layer_end;
-    return llama_model_load_from_file(args.model.c_str(), mparams);
+    mparams.pipeline_brick_tp_rank = args.tp_rank;
+    mparams.pipeline_brick_tp_size = args.tp_size;
+    if (args.tp_size > 1) {
+        mparams.use_mmap = false; // load TP shards into rank-local memory after CPU binding
+    }
+    llama_model * model = llama_model_load_from_file(args.model.c_str(), mparams);
+    if (args.tp_size > 1) {
+        const std::vector<uint64_t> numa_pages_after = read_numa_maps_pages();
+        print_numa_pages_line(args, "after_model_load", numa_pages_after);
+        print_numa_pages_line(args, "model_load_delta", numa_pages_after, &numa_pages_before);
+    }
+    return model;
 }
 
 static llama_context * make_context(llama_model * model, const pipeline_args & args, bool embeddings) {
@@ -1268,7 +2233,7 @@ template<typename Transport>
 static int run_head(const pipeline_args & args, Transport & transport) {
     llama_backend_init();
     bind_to_cpus(args.numa_cpus);
-    llama_numa_init(GGML_NUMA_STRATEGY_NUMACTL);
+    init_ggml_numa_for_binding(args);
 
     llama_model * model = load_brick_model(args);
     if (!model) {
@@ -1418,13 +2383,15 @@ static int run_head(const pipeline_args & args, Transport & transport) {
 
     const int64_t t_infer_end = ggml_time_us();
     const double infer_s = (t_infer_end - t_infer_start) / 1e6;
-    fprintf(stderr, "pipeline-brick perf: inference time %.2f s\n", infer_s);
-    fprintf(stderr, "pipeline-brick perf: total prompt tokens %lld, speed %.2f t/s\n",
-            (long long) n_total_prompt, n_total_prompt / infer_s);
-    fprintf(stderr, "pipeline-brick perf: total gen tokens %lld, speed %.2f t/s\n",
-            (long long) n_total_gen, n_total_gen / infer_s);
-    fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
-            (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
+    if (args.tp_size <= 1 || args.tp_rank == 0) {
+        fprintf(stderr, "pipeline-brick perf: inference time %.2f s\n", infer_s);
+        fprintf(stderr, "pipeline-brick perf: total prompt tokens %lld, speed %.2f t/s\n",
+                (long long) n_total_prompt, n_total_prompt / infer_s);
+        fprintf(stderr, "pipeline-brick perf: total gen tokens %lld, speed %.2f t/s\n",
+                (long long) n_total_gen, n_total_gen / infer_s);
+        fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
+                (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
+    }
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
     }
@@ -1442,7 +2409,7 @@ template<typename Transport>
 static int run_tail(const pipeline_args & args, Transport & transport) {
     llama_backend_init();
     bind_to_cpus(args.numa_cpus);
-    llama_numa_init(GGML_NUMA_STRATEGY_NUMACTL);
+    init_ggml_numa_for_binding(args);
 
     llama_model * model = load_brick_model(args);
     if (!model) {
@@ -1543,14 +2510,139 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         }
     }
 
-    for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
-        printf("[seq %d] %s\n", seq_id, outputs[seq_id].c_str());
+    if (args.tp_size <= 1 || args.tp_rank == 0) {
+        for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
+            printf("[seq %d] %s\n", seq_id, outputs[seq_id].c_str());
+        }
+        fflush(stdout);
     }
-    fflush(stdout);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
     }
 
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+}
+
+template<typename Upstream, typename Downstream>
+static int run_middle_stage(const pipeline_args & args, Upstream & upstream, Downstream & downstream) {
+    llama_backend_init();
+    bind_to_cpus(args.numa_cpus);
+    init_ggml_numa_for_binding(args);
+
+    llama_model * model = load_brick_model(args);
+    if (!model) {
+        fprintf(stderr, "pipeline-brick stage%d: failed to load model\n", args.stage_id);
+        return 2;
+    }
+
+    llama_context * ctx = make_context(model, args, true);
+    const int32_t n_embd = llama_model_n_embd(model);
+    if (n_embd != QWEN3_4B_N_EMBD) {
+        fprintf(stderr, "pipeline-brick stage%d: expected n_embd=%d, got %d\n", args.stage_id, QWEN3_4B_N_EMBD, n_embd);
+        return 2;
+    }
+
+    fprintf(stderr,
+            "pipeline-brick stage%d: brick=%d layers [%d,%d), parallel=%d, n_embd=%d, up/down transport active\n",
+            args.stage_id, args.brick_id, args.layer_start, args.layer_end, args.parallel, n_embd);
+    fprintf(stderr,
+            "pipeline-brick stage%d: micro-batch max=%d hidden_dtype=%s bytes_per_token=%zu\n",
+            args.stage_id, max_micro_batch_tokens(args), hidden_dtype_name(args.hidden_type),
+            (size_t) n_embd * hidden_dtype_size(args.hidden_type));
+    if (args.stream_kv) {
+        fprintf(stderr,
+                "pipeline-brick stage%d: stream-kv enabled sink=%d recent=%d\n",
+                args.stage_id, args.stream_kv_sink, args.stream_kv_recent);
+        llama_set_stream_kv_active(ctx, false);
+    }
+
+    llama_batch batch = llama_batch_init(max_micro_batch_tokens(args), n_embd, 1);
+
+    while (true) {
+        recv_packet packet = upstream.recv();
+        const brick_packet_header & header = packet.header;
+        if (header.flags & PIPELINE_FLAG_STOP) {
+            downstream.send_stop(header.seq_id, header.pos);
+            break;
+        }
+
+        const bool packet_bf16 = (header.flags & PIPELINE_FLAG_HIDDEN_BF16) != 0;
+        if (packet_bf16 != (args.hidden_type == hidden_dtype::bf16)) {
+            fprintf(stderr, "pipeline-brick stage%d: hidden dtype mismatch\n", args.stage_id);
+            return 3;
+        }
+
+        std::vector<hidden_token_meta> metas;
+        std::vector<float> hidden_f32;
+        if (!decode_hidden_payload(packet, args.hidden_type, n_embd, metas, hidden_f32)) {
+            fprintf(stderr, "pipeline-brick stage%d: invalid hidden payload\n", args.stage_id);
+            return 3;
+        }
+
+        batch.n_tokens = header.n_tokens;
+        memcpy(batch.embd, hidden_f32.data(), hidden_f32.size() * sizeof(float));
+        int32_t want_tokens = 0;
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            const hidden_token_meta & meta = metas[i];
+            if (meta.seq_id < 0 || meta.seq_id >= args.parallel) {
+                fprintf(stderr, "pipeline-brick stage%d: invalid seq_id %d\n", args.stage_id, meta.seq_id);
+                return 3;
+            }
+            const bool want_output = (meta.flags & PIPELINE_FLAG_WANT_LOGITS) != 0;
+            set_batch_entry(batch, i, meta.seq_id, meta.pos, want_output);
+            if (want_output) {
+                ++want_tokens;
+            }
+        }
+
+        if (args.stream_kv) {
+            const bool is_decode_packet = (header.flags & PIPELINE_FLAG_DECODE) != 0;
+            if (is_decode_packet) {
+                const bool sparse_active = header.pos + 1 > args.stream_kv_sink + args.stream_kv_recent;
+                llama_set_stream_kv_active(ctx, sparse_active);
+                if (args.verbose) {
+                    fprintf(stderr, "pipeline-brick stage%d: stream-kv decode pos=%d sparse=%d\n",
+                            args.stage_id, header.pos, sparse_active ? 1 : 0);
+                }
+            } else {
+                llama_set_stream_kv_active(ctx, false);
+            }
+        }
+
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "pipeline-brick stage%d: llama_decode failed at pos=%d n_tokens=%d\n",
+                    args.stage_id, header.pos, batch.n_tokens);
+            return 3;
+        }
+
+        std::vector<uint8_t> payload;
+        try {
+            payload = make_hidden_payload(ctx, metas, n_embd, args.hidden_type);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "pipeline-brick stage%d: %s\n", args.stage_id, e.what());
+            return 3;
+        }
+
+        downstream.send_hidden_payload(header.pos, batch.n_tokens, n_embd, header.flags, payload.data(), payload.size());
+        for (int32_t i = 0; i < want_tokens; ++i) {
+            recv_packet token = downstream.recv();
+            if (!(token.header.flags & PIPELINE_FLAG_TOKEN) || token.payload.size() != sizeof(token_payload)) {
+                fprintf(stderr, "pipeline-brick stage%d: expected downstream token packet\n", args.stage_id);
+                return 3;
+            }
+            token_payload payload_token;
+            memcpy(&payload_token, token.payload.data(), sizeof(payload_token));
+            upstream.send_token(payload_token.seq_id, (llama_token) payload_token.token);
+        }
+    }
+
+    if (args.stream_kv) {
+        llama_set_stream_kv_active(ctx, false);
+    }
     llama_batch_free(batch);
     llama_free(ctx);
     llama_model_free(model);
@@ -1582,8 +2674,446 @@ static int run_self_test_ntb(const pipeline_args & args) {
     return 0;
 }
 
+static pipeline_args make_link_args(const pipeline_args & args, bool downstream) {
+    pipeline_args link = args;
+    if (downstream) {
+        if (!args.down_tx_mw.empty()) {
+            link.tx_mw = args.down_tx_mw;
+        }
+        if (!args.down_rx_mw.empty()) {
+            link.rx_mw = args.down_rx_mw;
+        }
+        link.transport = args.down_transport;
+    } else {
+        if (!args.up_tx_mw.empty()) {
+            link.tx_mw = args.up_tx_mw;
+        }
+        if (!args.up_rx_mw.empty()) {
+            link.rx_mw = args.up_rx_mw;
+        }
+        link.transport = args.up_transport;
+    }
+    return link;
+}
+
+static std::unique_ptr<transport_box> open_transport_box(const pipeline_args & args, transport_kind kind, size_t max_payload_bytes, bool downstream) {
+    pipeline_args link = make_link_args(args, downstream);
+    link.transport = kind;
+    switch (kind) {
+        case transport_kind::ntb_mw:
+            return std::make_unique<transport_box>(ntb_mw_transport::open_transport(link, max_payload_bytes));
+        case transport_kind::cxl:
+            return std::make_unique<transport_box>(cxl_transport::open_transport(link, max_payload_bytes));
+        case transport_kind::ib_rdma:
+            return std::make_unique<transport_box>(ib_rdma_transport::open_transport(args, max_payload_bytes, downstream));
+        case transport_kind::zni_rdma:
+            return std::make_unique<transport_box>(zni_transport::open_transport(args, max_payload_bytes, downstream));
+    }
+    throw std::runtime_error("invalid transport kind");
+}
+
+struct tp_broadcast_shm {
+    volatile int sequence;
+    volatile int ack_count;
+    uint32_t payload_size;
+    uint32_t reserved;
+    brick_packet_header header;
+};
+
+template<typename Transport>
+struct tp_transport_proxy {
+    Transport * real;
+    int tp_rank;
+    int tp_size;
+    tp_broadcast_shm * shm;
+    size_t shm_size;
+    int seen_sequence = 0;
+
+    void send_hidden(int32_t seq_id, int32_t pos, int32_t n_embd, uint32_t flags, const float * payload) {
+        if (tp_rank == 0) {
+            real->send_hidden(seq_id, pos, n_embd, flags, payload);
+        }
+    }
+
+    void send_hidden_payload(int32_t pos, int32_t n_tokens, int32_t n_embd, uint32_t flags, const void * payload, uint64_t payload_bytes) {
+        if (tp_rank == 0) {
+            real->send_hidden_payload(pos, n_tokens, n_embd, flags, payload, payload_bytes);
+        }
+    }
+
+    void send_token(int32_t seq_id, llama_token token) {
+        if (tp_rank == 0) {
+            real->send_token(seq_id, token);
+        }
+    }
+
+    void send_stop(int32_t seq_id, int32_t pos) {
+        if (tp_rank == 0) {
+            real->send_stop(seq_id, pos);
+        }
+    }
+
+    recv_packet recv() {
+        uint8_t * payload_base = (uint8_t *) shm + align_up(sizeof(tp_broadcast_shm), 64);
+        const size_t payload_cap = shm_size - align_up(sizeof(tp_broadcast_shm), 64);
+
+        if (tp_rank == 0) {
+            if (seen_sequence > 0) {
+                while (__atomic_load_n(&shm->ack_count, __ATOMIC_ACQUIRE) < tp_size - 1) {
+#if defined(__aarch64__)
+                    __asm__ volatile("yield" ::: "memory");
+#endif
+                }
+            }
+
+            recv_packet pkt = real->recv();
+            if (pkt.payload.size() > payload_cap) {
+                throw std::runtime_error("TP broadcast payload exceeds shared buffer");
+            }
+
+            shm->header = pkt.header;
+            shm->payload_size = (uint32_t) pkt.payload.size();
+            if (!pkt.payload.empty()) {
+                memcpy(payload_base, pkt.payload.data(), pkt.payload.size());
+            }
+
+            __atomic_store_n(&shm->ack_count, 0, __ATOMIC_RELEASE);
+            ++seen_sequence;
+            __atomic_store_n(&shm->sequence, seen_sequence, __ATOMIC_RELEASE);
+            return pkt;
+        }
+
+        while (__atomic_load_n(&shm->sequence, __ATOMIC_ACQUIRE) == seen_sequence) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+
+        seen_sequence = __atomic_load_n(&shm->sequence, __ATOMIC_ACQUIRE);
+
+        recv_packet pkt;
+        pkt.header = shm->header;
+        const uint32_t payload_size = shm->payload_size;
+        if (payload_size > payload_cap) {
+            throw std::runtime_error("TP broadcast payload exceeds shared buffer");
+        }
+        if (payload_size > 0) {
+            pkt.payload.resize(payload_size);
+            memcpy(pkt.payload.data(), payload_base, payload_size);
+        }
+
+        __sync_fetch_and_add(&shm->ack_count, 1);
+        return pkt;
+    }
+};
+
+static std::string make_tp_model_path(const std::string & base_path, int tp_rank) {
+    const size_t dot = base_path.rfind('.');
+    if (dot == std::string::npos) {
+        return base_path + ".tp" + std::to_string(tp_rank);
+    }
+    return base_path.substr(0, dot) + ".tp" + std::to_string(tp_rank) + base_path.substr(dot);
+}
+
+static std::string tp_rank_numa_node(const pipeline_args & args, int tp_rank) {
+    std::string spec;
+    if (stage_mode_enabled(args)) {
+        std::vector<std::string> stage_specs = split_stage_specs(args.stage_numa);
+        if (args.stage_id < 0 || args.stage_id >= (int) stage_specs.size()) {
+            throw std::runtime_error("--stage-numa must contain a NUMA spec for this --stage-id");
+        }
+        spec = stage_specs[args.stage_id];
+    } else {
+        spec = args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD ? args.head_numa : args.tail_numa;
+    }
+    if (spec.empty()) {
+        throw std::runtime_error("NUMA node spec is required when --tp-size > 1");
+    }
+
+    std::vector<int> nodes = parse_cpu_list_ordered(spec);
+    if ((int) nodes.size() < args.tp_size) {
+        throw std::runtime_error("NUMA node list does not contain enough nodes for --tp-size");
+    }
+
+    if (args.tp_size == 2 && nodes.size() == 4) {
+        const size_t begin = (size_t) tp_rank * 2;
+        return join_cpu_list({ nodes[begin], nodes[begin + 1] });
+    }
+
+    return std::to_string(nodes[tp_rank]);
+}
+
+static size_t tp_broadcast_size(const pipeline_args & args) {
+    return align_up(sizeof(tp_broadcast_shm), 64) + max_hidden_payload_bytes(args) + 4096;
+}
+
+static size_t tp_all_reduce_size(const pipeline_args & args) {
+    const size_t max_elements = (size_t) QWEN3_4B_N_EMBD * (size_t) max_micro_batch_tokens(args);
+    return align_up(sizeof(uint64_t) * 8, 64) + max_elements * sizeof(float) * (size_t) args.tp_size + 65536;
+}
+
+static int run_hardware_tp(const pipeline_args & args) {
+    const int tp_size = args.tp_size;
+    const size_t bc_size = tp_broadcast_size(args);
+    const size_t ar_size = tp_all_reduce_size(args);
+    const size_t shm_size = align_up(bc_size, 64) + ar_size;
+    const size_t max_payload_bytes = max_hidden_payload_bytes(args);
+
+    void * shm = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shm == MAP_FAILED) {
+        throw std::runtime_error("TP shared mmap failed: " + std::string(strerror(errno)));
+    }
+
+    auto * bc_shm = (tp_broadcast_shm *) shm;
+    void * ar_shm = (uint8_t *) shm + align_up(bc_size, 64);
+
+    fprintf(stderr, "pipeline-brick TP: role=%s tp_size=%d broadcast=%zu all_reduce=%zu\n",
+            role_name(args.role).c_str(), tp_size, bc_size, ar_size);
+
+    std::vector<pid_t> children;
+    for (int r = 0; r < tp_size; ++r) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            munmap(shm, shm_size);
+            throw std::runtime_error("TP fork failed: " + std::string(strerror(errno)));
+        }
+
+        if (pid == 0) {
+            pipeline_args child_args = args;
+            child_args.tp_rank = r;
+            child_args.tp_size = tp_size;
+            child_args.numa_tp = 1;
+            child_args.threads = std::max(1, args.threads / tp_size);
+            child_args.model = make_tp_model_path(args.model, r);
+            child_args.numa_cpus = cpus_for_numa_nodes(tp_rank_numa_node(args, r));
+
+            ggml_tp_shm_init(r, tp_size, ar_shm, ar_size);
+
+            fprintf(stderr,
+                    "pipeline-brick TP: role=%s rank=%d/%d threads=%d cpus=%s model=%s\n",
+                    role_name(args.role).c_str(), r, tp_size, child_args.threads,
+                    child_args.numa_cpus.c_str(), child_args.model.c_str());
+
+            try {
+                if (args.transport == transport_kind::cxl) {
+                    std::unique_ptr<cxl_transport> real;
+                    if (r == 0) {
+                        real = std::make_unique<cxl_transport>(cxl_transport::open_transport(args, max_payload_bytes));
+                    }
+                    tp_transport_proxy<cxl_transport> transport{ real.get(), r, tp_size, bc_shm, bc_size };
+                    const int rc = args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD ?
+                        run_head(child_args, transport) : run_tail(child_args, transport);
+                    exit_tp_child(child_args, rc);
+                }
+
+                std::unique_ptr<ntb_mw_transport> real;
+                if (r == 0) {
+                    real = std::make_unique<ntb_mw_transport>(ntb_mw_transport::open_transport(args, max_payload_bytes));
+                }
+                tp_transport_proxy<ntb_mw_transport> transport{ real.get(), r, tp_size, bc_shm, bc_size };
+                const int rc = args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD ?
+                    run_head(child_args, transport) : run_tail(child_args, transport);
+                exit_tp_child(child_args, rc);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "pipeline-brick TP rank %d: %s\n", r, e.what());
+                _exit(1);
+            }
+        }
+
+        children.push_back(pid);
+    }
+
+    int exit_code = 0;
+    for (pid_t pid : children) {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) {
+            exit_code = 1;
+            continue;
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            exit_code = 1;
+        }
+    }
+
+    munmap(shm, shm_size);
+    return exit_code;
+}
+
+static bool stage_mode_enabled(const pipeline_args & args) {
+    return args.stage_count > 0 || args.stage_id >= 0 || args.role == LLAMA_PIPELINE_BRICK_ROLE_STAGE;
+}
+
+static pipeline_args normalize_stage_args(const pipeline_args & args) {
+    pipeline_args out = args;
+    if (out.stage_count == 0) {
+        out.stage_count = 4;
+    }
+    if (out.stage_count != 4) {
+        throw std::runtime_error("pipeline-brick stage mode currently supports --stage-count 4");
+    }
+    if (!out.stage_numa.empty() && (int) split_stage_specs(out.stage_numa).size() != out.stage_count) {
+        throw std::runtime_error("--stage-numa must contain one semicolon-separated NUMA spec per stage");
+    }
+    if (out.stage_id < 0 || out.stage_id >= out.stage_count) {
+        throw std::runtime_error("--stage-id must be in [0, stage-count)");
+    }
+    if (out.layer_start < 0 && out.layer_end < 0) {
+        const int layers_per_stage = QWEN3_4B_N_LAYER / out.stage_count;
+        out.layer_start = out.stage_id * layers_per_stage;
+        out.layer_end = out.stage_id == out.stage_count - 1 ? QWEN3_4B_N_LAYER : out.layer_start + layers_per_stage;
+    }
+    if (out.role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
+        if (out.stage_id == 0) {
+            out.role = LLAMA_PIPELINE_BRICK_ROLE_HEAD;
+        } else if (out.stage_id == out.stage_count - 1) {
+            out.role = LLAMA_PIPELINE_BRICK_ROLE_TAIL;
+        } else {
+            out.role = LLAMA_PIPELINE_BRICK_ROLE_STAGE;
+        }
+    }
+    if (out.brick_id < 0) {
+        out.brick_id = out.stage_id;
+    }
+    if (out.peer_brick_id < 0) {
+        out.peer_brick_id = out.stage_id < out.stage_count - 1 ? out.stage_id + 1 : out.stage_id - 1;
+    }
+    return out;
+}
+
+static int run_hardware_stage_tp(const pipeline_args & raw_args) {
+    pipeline_args args = normalize_stage_args(raw_args);
+    const int tp_size = args.tp_size;
+    const size_t bc_size = tp_broadcast_size(args);
+    const size_t ar_size = tp_all_reduce_size(args);
+    const size_t up_bc_offset = 0;
+    const size_t down_bc_offset = align_up(bc_size, 64);
+    const size_t ar_offset = down_bc_offset + align_up(bc_size, 64);
+    const size_t shm_size = ar_offset + ar_size;
+    const size_t max_payload_bytes = max_hidden_payload_bytes(args);
+
+    void * shm = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shm == MAP_FAILED) {
+        throw std::runtime_error("stage TP shared mmap failed: " + std::string(strerror(errno)));
+    }
+
+    auto * up_bc_shm = (tp_broadcast_shm *) ((uint8_t *) shm + up_bc_offset);
+    auto * down_bc_shm = (tp_broadcast_shm *) ((uint8_t *) shm + down_bc_offset);
+    void * ar_shm = (uint8_t *) shm + ar_offset;
+
+    fprintf(stderr,
+            "pipeline-brick stage%d TP: layers [%d,%d) role=%s tp_size=%d broadcast=%zu all_reduce=%zu\n",
+            args.stage_id, args.layer_start, args.layer_end, role_name(args.role).c_str(),
+            tp_size, bc_size, ar_size);
+
+    std::vector<pid_t> children;
+    for (int r = 0; r < tp_size; ++r) {
+        const pid_t pid = fork();
+        if (pid < 0) {
+            munmap(shm, shm_size);
+            throw std::runtime_error("stage TP fork failed: " + std::string(strerror(errno)));
+        }
+
+        if (pid == 0) {
+            pipeline_args child_args = args;
+            child_args.tp_rank = r;
+            child_args.tp_size = tp_size;
+            child_args.numa_tp = 1;
+            child_args.threads = std::max(1, args.threads / tp_size);
+            child_args.model = make_tp_model_path(args.model, r);
+            child_args.numa_cpus = cpus_for_numa_nodes(tp_rank_numa_node(args, r));
+
+            ggml_tp_shm_init(r, tp_size, ar_shm, ar_size);
+
+            fprintf(stderr,
+                    "pipeline-brick stage%d TP: rank=%d/%d threads=%d cpus=%s model=%s\n",
+                    args.stage_id, r, tp_size, child_args.threads,
+                    child_args.numa_cpus.c_str(), child_args.model.c_str());
+
+            try {
+                if (args.stage_id == 0) {
+                    std::unique_ptr<transport_box> down_real;
+                    if (r == 0) {
+                        down_real = open_transport_box(child_args, child_args.down_transport, max_payload_bytes, true);
+                    }
+                    tp_transport_proxy<transport_box> down{ down_real.get(), r, tp_size, down_bc_shm, bc_size };
+                    const int rc = run_head(child_args, down);
+                    exit_tp_child(child_args, rc);
+                }
+
+                if (args.stage_id == args.stage_count - 1) {
+                    std::unique_ptr<transport_box> up_real;
+                    if (r == 0) {
+                        up_real = open_transport_box(child_args, child_args.up_transport, max_payload_bytes, false);
+                    }
+                    tp_transport_proxy<transport_box> up{ up_real.get(), r, tp_size, up_bc_shm, bc_size };
+                    const int rc = run_tail(child_args, up);
+                    exit_tp_child(child_args, rc);
+                }
+
+                std::unique_ptr<transport_box> up_real;
+                std::unique_ptr<transport_box> down_real;
+                if (r == 0) {
+                    up_real = open_transport_box(child_args, child_args.up_transport, max_payload_bytes, false);
+                    down_real = open_transport_box(child_args, child_args.down_transport, max_payload_bytes, true);
+                }
+                tp_transport_proxy<transport_box> up{ up_real.get(), r, tp_size, up_bc_shm, bc_size };
+                tp_transport_proxy<transport_box> down{ down_real.get(), r, tp_size, down_bc_shm, bc_size };
+                const int rc = run_middle_stage(child_args, up, down);
+                exit_tp_child(child_args, rc);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "pipeline-brick stage%d TP rank %d: %s\n", args.stage_id, r, e.what());
+                _exit(1);
+            }
+        }
+
+        children.push_back(pid);
+    }
+
+    int exit_code = 0;
+    for (pid_t pid : children) {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "pipeline-brick stage%d TP: child %d exited abnormally\n",
+                    args.stage_id, (int) pid);
+            exit_code = 1;
+        }
+    }
+
+    munmap(shm, shm_size);
+    return exit_code;
+}
+
+static int run_hardware_stage(const pipeline_args & raw_args) {
+    pipeline_args args = normalize_stage_args(raw_args);
+    if (args.tp_size > 1) {
+        return run_hardware_stage_tp(args);
+    }
+    const size_t max_payload_bytes = max_hidden_payload_bytes(args);
+
+    if (args.stage_id == 0) {
+        auto down = open_transport_box(args, args.down_transport, max_payload_bytes, true);
+        return run_head(args, *down);
+    }
+    if (args.stage_id == args.stage_count - 1) {
+        auto up = open_transport_box(args, args.up_transport, max_payload_bytes, false);
+        return run_tail(args, *up);
+    }
+
+    auto up = open_transport_box(args, args.up_transport, max_payload_bytes, false);
+    auto down = open_transport_box(args, args.down_transport, max_payload_bytes, true);
+    return run_middle_stage(args, *up, *down);
+}
+
 static int run_hardware(const pipeline_args & args) {
     const size_t max_payload_bytes = max_hidden_payload_bytes(args);
+
+    if (stage_mode_enabled(args)) {
+        return run_hardware_stage(args);
+    }
+
+    if (args.tp_size > 1) {
+        return run_hardware_tp(args);
+    }
 
     if (args.numa_tp > 1) {
         fprintf(stderr,
@@ -1658,7 +3188,96 @@ static pipeline_args make_single_system_child_args(
     return child;
 }
 
+static int run_single_system_stages(const pipeline_args & args) {
+    if (args.stage_count != 4) {
+        throw std::runtime_error("single-system stage mode requires --stage-count 4");
+    }
+    std::vector<std::string> numa_specs = split_stage_specs(args.stage_numa);
+    if ((int) numa_specs.size() != args.stage_count) {
+        throw std::runtime_error("--stage-numa must contain four semicolon-separated NUMA specs");
+    }
+
+    const size_t max_payload_bytes = max_hidden_payload_bytes(args);
+    const size_t window_size = transport_window_size(max_payload_bytes);
+    const std::string base = "/dev/shm/llama-pipeline-brick-stage-" + std::to_string(getpid());
+
+    std::vector<std::string> fwd(args.stage_count - 1);
+    std::vector<std::string> rev(args.stage_count - 1);
+    for (int i = 0; i < args.stage_count - 1; ++i) {
+        fwd[i] = base + "-s" + std::to_string(i) + "-to-s" + std::to_string(i + 1);
+        rev[i] = base + "-s" + std::to_string(i + 1) + "-to-s" + std::to_string(i);
+        create_shared_window_file(fwd[i], window_size);
+        create_shared_window_file(rev[i], window_size);
+        if (args.transport == transport_kind::cxl) {
+            bind_shared_window_to_numa(fwd[i], window_size, numa_specs[i + 1], "stage-forward");
+            bind_shared_window_to_numa(rev[i], window_size, numa_specs[i], "stage-reverse");
+        }
+    }
+
+    fprintf(stderr, "pipeline-brick single-system stages: stage_count=%d window_size=%zu\n", args.stage_count, window_size);
+
+    std::vector<pid_t> pids;
+    for (int sid = args.stage_count - 1; sid >= 0; --sid) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            throw std::runtime_error("fork stage failed: " + std::string(strerror(errno)));
+        }
+        if (pid == 0) {
+            pipeline_args child = args;
+            child.single_system = false;
+            child.hardware = true;
+            child.stage_id = sid;
+            child.role = sid == 0 ? LLAMA_PIPELINE_BRICK_ROLE_HEAD :
+                (sid == args.stage_count - 1 ? LLAMA_PIPELINE_BRICK_ROLE_TAIL : LLAMA_PIPELINE_BRICK_ROLE_STAGE);
+            child.brick_id = sid;
+            child.peer_brick_id = sid == args.stage_count - 1 ? sid - 1 : sid + 1;
+            child.layer_start = -1;
+            child.layer_end = -1;
+            child.numa_cpus = cpus_for_numa_nodes(numa_specs[sid]);
+            child.db_mode = doorbell_mode::poll;
+            child.up_transport = args.transport;
+            child.down_transport = args.transport;
+            child.tx_doorbell.clear();
+            child.rx_doorbell.clear();
+            if (sid > 0) {
+                child.up_rx_mw = fwd[sid - 1];
+                child.up_tx_mw = rev[sid - 1];
+            }
+            if (sid < args.stage_count - 1) {
+                child.down_tx_mw = fwd[sid];
+                child.down_rx_mw = rev[sid];
+            }
+            try {
+                const int rc = run_hardware(child);
+                _exit(rc);
+            } catch (const std::exception & e) {
+                fprintf(stderr, "pipeline-brick stage%d: %s\n", sid, e.what());
+                _exit(1);
+            }
+        }
+        pids.push_back(pid);
+        sleep_us(200000);
+    }
+
+    int exit_code = 0;
+    for (pid_t pid : pids) {
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            exit_code = 1;
+        }
+    }
+    for (int i = 0; i < args.stage_count - 1; ++i) {
+        unlink(fwd[i].c_str());
+        unlink(rev[i].c_str());
+    }
+    return exit_code;
+}
+
 static int run_single_system(const pipeline_args & args) {
+    if (stage_mode_enabled(args)) {
+        return run_single_system_stages(args);
+    }
+
     const size_t max_payload_bytes = max_hidden_payload_bytes(args);
     const size_t window_size = transport_window_size(max_payload_bytes);
     const std::string base = "/dev/shm/llama-pipeline-brick-" + std::to_string(getpid());
@@ -1667,8 +3286,10 @@ static int run_single_system(const pipeline_args & args) {
 
     create_shared_window_file(h2t_path, window_size);
     create_shared_window_file(t2h_path, window_size);
-    bind_shared_window_to_numa(h2t_path, window_size, args.tail_numa, "head-to-tail");
-    bind_shared_window_to_numa(t2h_path, window_size, args.head_numa, "tail-to-head");
+    if (args.transport == transport_kind::cxl) {
+        bind_shared_window_to_numa(h2t_path, window_size, args.tail_numa, "head-to-tail");
+        bind_shared_window_to_numa(t2h_path, window_size, args.head_numa, "tail-to-head");
+    }
 
     fprintf(stderr,
             "pipeline-brick single-system: head NUMA=%s tail NUMA=%s window_size=%zu\n",
@@ -1721,6 +3342,7 @@ static int run_single_system(const pipeline_args & args) {
 int main(int argc, char ** argv) {
     try {
         pipeline_args args = parse_args(argc, argv);
+        apply_domain_mode_defaults(args);
         validate_args(args);
         llama_log_set(pipeline_brick_log_callback, &args.verbose);
 

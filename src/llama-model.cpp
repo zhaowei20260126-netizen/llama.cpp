@@ -2273,6 +2273,8 @@ llama_model_params llama_model_default_params() {
         /*.pipeline_brick_role         =*/ LLAMA_PIPELINE_BRICK_ROLE_NONE,
         /*.pipeline_brick_layer_start  =*/ 0,
         /*.pipeline_brick_layer_end    =*/ 0,
+        /*.pipeline_brick_tp_rank      =*/ 0,
+        /*.pipeline_brick_tp_size      =*/ 1,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

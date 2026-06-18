@@ -1,0 +1,372 @@
+<h2 class="sr-only">Feibric three-level parallel scheme: QPI TP-1, CXL TP-2, RDMA PP</h2>
+
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.6; color: #2C2C2A; background: #fff; max-width: 720px; margin: 0 auto; padding: 40px 32px; }
+  h1 { font-size: 18px; font-weight: 500; color: #26215C; margin-bottom: 4px; }
+  h2 { font-size: 15px; font-weight: 500; color: #26215C; margin: 32px 0 12px; padding-bottom: 6px; border-bottom: 1px solid #D3D1C7; }
+  h3 { font-size: 14px; font-weight: 500; color: #534AB7; margin: 20px 0 8px; }
+  .subtitle { font-size: 13px; color: #5F5E5A; margin-bottom: 20px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0 16px; font-size: 12px; }
+  th { background: #EEEDFE; color: #3C3489; font-weight: 500; text-align: left; padding: 8px 10px; border: 1px solid #D3D1C7; }
+  td { padding: 7px 10px; border: 1px solid #D3D1C7; }
+  tr:nth-child(even) td { background: #F1EFE8; }
+  .box { border: 1px solid #D3D1C7; border-radius: 8px; padding: 16px 20px; margin: 12px 0 16px; background: #F1EFE8; }
+  .box-purple { border-color: #CECBF6; background: #EEEDFE; }
+  .box-blue { border-color: #B5D4F4; background: #E6F1FB; }
+  .box-teal { border-color: #9FE1CB; background: #E1F5EE; }
+  .box-coral { border-color: #F5C4B3; background: #FAECE7; }
+  .box-title { font-weight: 500; font-size: 13px; color: #3C3489; margin-bottom: 6px; }
+  .note { background: #FAEEDA; border-left: 3px solid #EF9F27; padding: 8px 12px; margin: 12px 0; font-size: 12px; border-radius: 0 6px 6px 0; }
+  .grid { display: grid; gap: 12px; margin: 12px 0 16px; }
+  .grid-2 { grid-template-columns: 1fr 1fr; }
+  .grid-3 { grid-template-columns: 1fr 1fr 1fr; }
+  p { margin-bottom: 10px; }
+  ul { margin: 4px 0 10px 20px; }
+  li { margin-bottom: 2px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; margin-right: 4px; }
+  .tag-qpi { background: #CECBF6; color: #3C3489; }
+  .tag-cxl { background: #E1F5EE; color: #085041; }
+  .tag-rdma { background: #FAECE7; color: #993C1D; }
+  .flow-step { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .flow-num { width: 22px; height: 22px; border-radius: 11px; background: #534AB7; color: #fff; font-size: 11px; font-weight: 500; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+  .flow-num-cxl { background: #1D9E75; }
+  .flow-content { flex: 1; }
+</style>
+
+<h1>Feibric 三级并行方案</h1>
+<p class="subtitle">
+  <span class="tag tag-qpi">TP-1: QPI</span>
+  <span class="tag tag-cxl">TP-2: CXL</span>
+  <span class="tag tag-rdma">PP: RDMA</span>
+  &nbsp;&nbsp;|&nbsp;&nbsp; 4x FT4000 &middot; 2 Domain &times; 2 CPU &middot; Domain 间 RDMA 直连
+</p>
+
+
+
+<h2>一、硬件拓扑</h2>
+
+<p>4 块 FT4000 CPU 分属两个 Domain，通过三种链路互联。每个 Domain 内只有 2 台 CPU。</p>
+
+<div class="grid grid-2" style="margin-bottom: 16px;">
+  <div class="box box-purple">
+    <div class="box-title">Domain A（Linux 实例 1）</div>
+    <table>
+      <tr><td style="border:none; background:none; padding:3px 0;">CPU 0</td><td style="border:none; background:none; padding:3px 0;">NUMA 0–3</td><td style="border:none; background:none; padding:3px 0;">64 核 128 GB</td></tr>
+      <tr><td style="border:none; background:none; padding:3px 0;">CPU 1</td><td style="border:none; background:none; padding:3px 0;">NUMA 4–7</td><td style="border:none; background:none; padding:3px 0;">64 核 128 GB</td></tr>
+      <tr><td colspan="3" style="border:none; background:none; padding:3px 0; color: #534AB7; font-size:11px;">CPU 内: QPI &emsp; CPU 间: CXL</td></tr>
+    </table>
+  </div>
+  <div class="box box-blue">
+    <div class="box-title">Domain B（Linux 实例 2）</div>
+    <table>
+      <tr><td style="border:none; background:none; padding:3px 0;">CPU 2</td><td style="border:none; background:none; padding:3px 0;">NUMA 8–11</td><td style="border:none; background:none; padding:3px 0;">64 核 128 GB</td></tr>
+      <tr><td style="border:none; background:none; padding:3px 0;">CPU 3</td><td style="border:none; background:none; padding:3px 0;">NUMA 12–15</td><td style="border:none; background:none; padding:3px 0;">64 核 128 GB</td></tr>
+      <tr><td colspan="3" style="border:none; background:none; padding:3px 0; color: #185FA5; font-size:11px;">CPU 内: QPI &emsp; CPU 间: CXL</td></tr>
+    </table>
+  </div>
+</div>
+
+<div style="text-align: center; margin: 12px 0; font-size: 12px; color: #993C1D;">
+  Domain A &emsp; &#x2194; &emsp; <strong>RDMA 直连</strong>（独立地址空间，send/recv）&emsp; &#x2194; &emsp; Domain B
+</div>
+
+<div class="note">
+  <strong>关键约束：</strong>每个 Domain 只有 2 台 CPU。这决定了 CXL 方向的并行度上限为 2，以及 QPI 方向必须承担全部集合通信。
+</div>
+
+<h3>三种链路对比</h3>
+<table>
+  <tr><th>链路</th><th>连接范围</th><th>带宽</th><th>延迟</th><th>地址空间</th><th>通信方式</th></tr>
+  <tr><td><span class="tag tag-qpi">QPI</span></td><td>CPU 内 NUMA 间</td><td>~50 GB/s</td><td>~0.1 us</td><td>共享</td><td>load/store</td></tr>
+  <tr><td><span class="tag tag-cxl">CXL</span></td><td>Domain 内 CPU 间</td><td>~15 GB/s</td><td>~1.5 us</td><td>共享</td><td>load/store（需 mbind）</td></tr>
+  <tr><td><span class="tag tag-rdma">RDMA</span></td><td>Domain 间</td><td>25–100 Gbps</td><td>~5 us</td><td>独立</td><td>send/recv（ibverbs）</td></tr>
+</table>
+
+
+
+<h2>二、两级张量并行（Domain 内）</h2>
+
+<div class="note">
+  <strong>与 report.pdf 一致：</strong>本节严格遵循"多级CPU张量并行分解方案技术调研报告"的 2D SUMMA 设计。所有集合通信（All-Gather、All-Reduce）限制在 QPI 域内，CXL 仅承担激活值子集分发。
+</div>
+
+<h3>2.1 2D SUMMA 网格：R=2, C=4</h3>
+
+<p>一个 Domain 内 8 个 NUMA 组织为 2&times;4 网格（<strong>R=2 为 CXL 方向，C=4 为 QPI 方向</strong>）：</p>
+
+<div class="grid grid-2">
+  <div class="box box-purple">
+    <div class="box-title">行 0 = QPI 域（CPU 0）</div>
+    NUMA 0 &emsp; NUMA 1 &emsp; NUMA 2 &emsp; NUMA 3<br>
+    <span style="font-size:11px;color:#5F5E5A;">4 个单元 &middot; 全部在 CPU 0 上 &middot; QPI 互联</span>
+  </div>
+  <div class="box box-blue">
+    <div class="box-title">行 1 = QPI 域（CPU 1）</div>
+    NUMA 0 &emsp; NUMA 1 &emsp; NUMA 2 &emsp; NUMA 3<br>
+    <span style="font-size:11px;color:#5F5E5A;">4 个单元 &middot; 全部在 CPU 1 上 &middot; QPI 互联</span>
+  </div>
+</div>
+
+<div style="text-align: center; margin: 12px 0; font-size: 12px; color: #1D9E75;">
+  行 0 &harr; 行 1 之间：<strong>CXL 链路</strong>（跨 CPU）&emsp; | &emsp; 每个对应 NUMA 对 (r,c) 由 CXL 连接
+</div>
+
+<table>
+  <tr><th>参数</th><th>含义</th><th>值</th><th>物理链路</th></tr>
+  <tr><td>R</td><td>行数（CXL 方向）</td><td>2</td><td>Domain 内 2 个 CPU</td></tr>
+  <tr><td>C</td><td>列数（QPI 方向）</td><td>4</td><td>每 CPU 内 4 个 NUMA</td></tr>
+  <tr><td>N</td><td>总并行单元</td><td>8</td><td>Domain 内全部 NUMA</td></tr>
+</table>
+
+<div class="note">
+  <strong>为什么 R=2, C=4 而不是反过来？</strong>QPI 域必须只包含同一 CPU 内的 NUMA。如果让 C=2（把跨 CPU 的两个 NUMA 放在同一行），行内 All-Gather 就会穿过 CXL，违反了 report 的核心设计原则。R=2（跨 CPU）&times; C=4（同 CPU 内 4 NUMA）确保每行内部通信走纯 QPI。
+</div>
+
+<h3>2.2 TP-1（QPI 方向，C=4）：沿隐藏维度切分</h3>
+
+<p>每 CPU 内 4 个 NUMA 各持有输入/输出通道的 1/4。所有 All-Gather 和 All-Reduce 在同 CPU 的 4 个 NUMA 之间通过 QPI 完成。</p>
+
+<div class="box box-purple">
+  <div class="box-title">MLP 第一个线性层 W&sub1; &isin; &#8477;<sup>2560&times;6912</sup></div>
+
+  <div class="flow-step"><div class="flow-num">1</div><div class="flow-content">沿 CXL 方向（R=2）切隐藏维度 h：每行 1280 维</div></div>
+  <div class="flow-step"><div class="flow-num">2</div><div class="flow-content">沿 QPI 方向（C=4）切扩展维度 4h：每单元 1728 维</div></div>
+  <div class="flow-step"><div class="flow-num">3</div><div class="flow-content">每单元持有 <strong>W&sub1;&sup1;&#8311;&#7472;&sup1;</strong> &isin; &#8477;<sup>1280&times;1728</sup></div></div>
+
+  <p style="margin-top:12px;font-size:12px;"><strong>前向计算：</strong></p>
+  <table>
+    <tr><th>步骤</th><th>操作</th><th>通信</th><th>链路</th></tr>
+    <tr><td>1</td><td>每行 r 计算 Y&sup1;&#8311;&#7472;&sup1; = X&sup1;&#8311;&sup1; &middot; W&sub1;&sup1;&#8311;&#7472;&sup1;（无通信）</td><td>&mdash;</td><td>&mdash;</td></tr>
+    <tr><td>2</td><td>行内 All-Gather：拼接 C=4 个单元的 1728 维输出 &rarr; 完整 6912 维</td><td>7 KB/行</td><td><span class="tag tag-qpi">QPI</span></td></tr>
+    <tr><td>3</td><td>GeLU 激活</td><td>&mdash;</td><td>&mdash;</td></tr>
+    <tr><td>4</td><td>W&sub2; 切分维度互换：每单元 W&sub2;&sup1;&#8311;&#7472;&sup1; &isin; &#8477;<sup>1728&times;640</sup></td><td>&mdash;</td><td>&mdash;</td></tr>
+    <tr><td>5</td><td>行内 All-Reduce：C=4 个单元 640 维输出求和</td><td>5 KB/行</td><td><span class="tag tag-qpi">QPI</span></td></tr>
+  </table>
+
+  <p style="font-size:11px;color:#5F5E5A;margin-top:8px;">CXL 仅在 W&sub2; 的 Step 4 中涉及：每个节点需要 GeLU 输出的对应子集（基于其列位置），由 CXL 分发少量激活值数据。此项通信量极小，非集合操作。</p>
+</div>
+
+<h3>2.3 TP-2（CXL 方向，R=2）：沿注意力头切分</h3>
+
+<div class="box box-teal">
+  <div class="box-title">Attention 模块 &middot; 32 注意力头</div>
+  <p>32 头 &rarr; 8 单元 &rarr; <strong>每 NUMA 4 个头</strong></p>
+
+  <table>
+    <tr><th>步骤</th><th>操作</th><th>通信</th></tr>
+    <tr><td>1</td><td>每单元独立计算自己的 4 个头的 Q/K/V 投影（无通信）</td><td>&mdash;</td></tr>
+    <tr><td>2</td><td>每单元独立计算 4 个头的 Attention（无通信）</td><td>&mdash;</td></tr>
+    <tr><td>3</td><td>输出投影 O&sup1;&#8311;&#7472;&sup1; = Attn &middot; W<sub>O</sub>&sup1;&#8311;&#7472;&sup1;</td><td>&mdash;</td></tr>
+    <tr><td>4</td><td>行内 All-Reduce（QPI）：聚合 C=4 个 NUMA 的部分输出</td><td><span class="tag tag-qpi">QPI</span></td></tr>
+  </table>
+
+  <p style="font-size:12px;margin-top:8px;">Attention 核心计算（QKV 投影 + softmax）<strong>完全无跨单元通信</strong>，因为不同注意力头天然独立。CXL 在 Attention 模块中不参与任何集合通信。</p>
+</div>
+
+<h3>2.4 两级 TP 通信量总结（每层每 token）</h3>
+
+<table>
+  <tr><th>操作</th><th>模块</th><th>链路</th><th>数据量</th><th>延迟</th><th>占比</th></tr>
+  <tr><td>All-Gather</td><td>MLP W&sub1;</td><td><span class="tag tag-qpi">QPI</span></td><td>~7 KB</td><td>~0.2 us</td><td>&lt; 1%</td></tr>
+  <tr><td>All-Reduce</td><td>MLP W&sub2;</td><td><span class="tag tag-qpi">QPI</span></td><td>~5 KB</td><td>~0.2 us</td><td>&lt; 1%</td></tr>
+  <tr><td>All-Reduce</td><td>Attention</td><td><span class="tag tag-qpi">QPI</span></td><td>~5 KB</td><td>~0.2 us</td><td>&lt; 1%</td></tr>
+  <tr><td>激活子集分发</td><td>MLP W&sub2;</td><td><span class="tag tag-cxl">CXL</span></td><td>~3.5 KB</td><td>~1.5 us</td><td>~1%</td></tr>
+</table>
+
+<div class="note">
+  <strong>所有集合通信在 QPI 上完成，占总计算时间 &lt; 3%。</strong> CXL 仅用于分发激活值子集（非集合操作），通信量最小。这与 report.pdf 的设计原则完全一致。
+</div>
+
+
+
+<h2>三、第三级：RDMA 流水线并行（Domain 间）</h2>
+
+<div class="note">
+  <strong>本节为 Feibric 在 report.pdf 基础上的原创扩展。</strong>report.pdf 仅覆盖单个 Domain 内的 2D TP，未讨论多 Domain 场景。此处引入 RDMA 流水线并行以充分利用 4 CPU 硬件资源。
+</div>
+
+<h3>3.1 层分配</h3>
+
+<div class="grid grid-2">
+  <div class="box box-purple">
+    <div class="box-title">Domain A：Head</div>
+    Layers 0–17（18 层）<br>
+    含 Embedding 层<br>
+    每层做 2D TP（R=2, C=4）
+  </div>
+  <div class="box box-blue">
+    <div class="box-title">Domain B：Tail</div>
+    Layers 18–35（18 层）<br>
+    含 LM Head<br>
+    每层做 2D TP（R=2, C=4）
+  </div>
+</div>
+
+<p style="font-size:12px;color:#5F5E5A;">切分点位于 Layer 17/18：36 层对半分保证负载均衡；不跨越特殊层结构；单次 hidden state 传输，通信量最小。</p>
+
+<h3>3.2 为什么走 RDMA</h3>
+
+<p>两个 Domain 是独立 Linux 实例 &mdash; <strong>物理上没有共享内存</strong>。必须在网络传输方案中选择：</p>
+
+<table>
+  <tr><th>方案</th><th>延迟</th><th>适用性</th></tr>
+  <tr><td>TCP socket</td><td>~50 us</td><td style="color:#A32D2D;">延迟过高</td></tr>
+  <tr><td>RDMA（ibverbs）</td><td>~5 us</td><td style="color:#3B6D11;">最优选择</td></tr>
+  <tr><td>CXL</td><td>不可用</td><td>CXL 跨不了独立 OS</td></tr>
+</table>
+
+<p>每 token 仅传输 1 次 hidden states（2560 &times; BF16 = <strong>5 KB</strong>），带宽需求极低。延迟是唯一关键指标，RDMA 的 5 us 是最优解。</p>
+
+<h3>3.3 双缓冲与延迟隐藏</h3>
+
+<div class="box box-coral">
+  <table>
+    <tr><th style="background:#FAECE7; color:#993C1D;">时刻</th><th style="background:#FAECE7; color:#993C1D;">Slot 0</th><th style="background:#FAECE7; color:#993C1D;">Slot 1</th></tr>
+    <tr><td>Token N</td><td>Domain A 写入 &rarr; RDMA &rarr; Domain B 读取</td><td>空闲</td></tr>
+    <tr><td>Token N+1</td><td>空闲</td><td>Domain A 写入 &rarr; RDMA &rarr; Domain B 读取</td></tr>
+  </table>
+  <p style="font-size:12px;margin-top:8px;">
+    当 Domain A 向 Slot 0 写入并启动 RDMA SEND 后，立即开始计算下一个 token 的 Layer 0。
+    RDMA 的 5 us 传输时间完全被 Domain A 的 ~150 us Layer 0 计算覆盖，<strong>端到端延迟中不可见</strong>。
+  </p>
+</div>
+
+
+
+<h2>四、三级并行全局视图</h2>
+
+<table>
+  <tr><th>级别</th><th>并行</th><th>物理链路</th><th>切分维度</th><th>集合通信</th><th>通信频率</th></tr>
+  <tr>
+    <td><strong>TP-1</strong></td>
+    <td><span class="tag tag-qpi">QPI</span></td>
+    <td>CPU 内 NUMA 间（C=4）</td>
+    <td>隐藏维度 h/2+R</td>
+    <td>All-Gather + All-Reduce</td>
+    <td>每层 3 次</td>
+  </tr>
+  <tr>
+    <td><strong>TP-2</strong></td>
+    <td><span class="tag tag-cxl">CXL</span></td>
+    <td>Domain 内 CPU 间（R=2）</td>
+    <td>扩展维度 4h/C + 注意力头</td>
+    <td>无（仅激活子集分发）</td>
+    <td>每层 1 次</td>
+  </tr>
+  <tr>
+    <td><strong>PP</strong></td>
+    <td><span class="tag tag-rdma">RDMA</span></td>
+    <td>Domain 间</td>
+    <td>模型层（0–17 / 18–35）</td>
+    <td>无（双缓冲 send/recv）</td>
+    <td>每 token 1 次</td>
+  </tr>
+</table>
+
+<h3>单 token 完整数据流</h3>
+
+<div class="box box-purple" style="margin-bottom:8px;">
+  <div class="box-title">Domain A：Layers 0–17（每层）</div>
+  <p style="font-size:12px;margin:0;">
+    MLP All-Gather（QPI, 行内 C=4）&rarr; GeLU &rarr; MLP All-Reduce（QPI）&rarr;<br>
+    Attn 独立计算 &rarr; Attn All-Reduce（QPI）&rarr;<br>
+    &darr; Layer 17 输出 hidden states（5 KB）
+  </p>
+</div>
+<div style="text-align:center; margin:4px 0; font-size:12px; color:#993C1D;">
+  &#x2193; RDMA SEND/RECV（5 us，双缓冲隐藏）&#x2193;
+</div>
+<div class="box box-blue" style="margin-top:8px;">
+  <div class="box-title">Domain B：Layers 18–35（每层）</div>
+  <p style="font-size:12px;margin:0;">
+    同上 &rarr; LM Head &rarr; token 采样 &rarr; 输出
+  </p>
+</div>
+
+
+
+<h2>五、QPI &times; CXL 的设计必然性</h2>
+
+<h3>QPI 承担全部集合通信</h3>
+<p>report.pdf 明确指出 All-Gather 和 All-Reduce 必须限制在 QPI 域内。一个"QPI 域"定义为同一 CPU 内的 NUMA 集合。为此选择了 R=2, C=4 的网格布局，确保每行（QPI 域）的 C=4 个单元全在同一 CPU 内。</p>
+
+<h3>CXL 只做轻量分发</h3>
+<p>Domain 只有 2 个 CPU（R=2），CXL 方向的设备数先天有限。这恰好匹配 CXL 的定位 &mdash; 不承担高频集合通信，只做低频率的激活值子集分发。每层 CXL 通信仅 1 次，数据量 ~3.5 KB，总开销 &lt; 2 us。</p>
+
+<h3>RDMA 填补 Domain 间的空白</h3>
+<p>两个 Domain 之间不存在共享内存，必须走网络。PP 每 token 只传 5 KB，RDMA 的低延迟（5 us）是关键选择因素。双缓冲设计确保传输延迟完全隐藏在计算中。</p>
+
+
+
+<h2>六、预期性能</h2>
+
+<table>
+  <tr><th>组件</th><th>延迟（us）</th><th>占比</th></tr>
+  <tr><td>单层 MLP 计算（1/8 权重）</td><td>~80</td><td rowspan="3" style="vertical-align:middle;">&gt; 96%<br>计算主导</td></tr>
+  <tr><td>单层 Attn 计算（4 头独立）</td><td>~50</td></tr>
+  <tr><td>单层 QPI All-Reduce（3 次）</td><td>~0.6</td></tr>
+  <tr><td>单层 CXL 激活分发</td><td>~1.5</td><td>~1%</td></tr>
+  <tr><td>18 层 Domain A 合计</td><td>~2.4 ms</td><td></td></tr>
+  <tr><td>RDMA hidden state</td><td>0（双缓冲隐藏）</td><td></td></tr>
+  <tr><td>18 层 Domain B 合计</td><td>~2.4 ms</td><td></td></tr>
+  <tr style="font-weight:500;"><td>每 token 总计</td><td>~4.8 ms</td><td>&rarr; ~208 tok/s（理论）</td></tr>
+</table>
+
+<table style="margin-top: 16px;">
+  <tr><th>配置</th><th>吞吐（tok/s）</th><th>加速比</th></tr>
+  <tr><td>单 CPU 64 核，无并行</td><td>3</td><td>1.0&times;</td></tr>
+  <tr><td>单 Domain 2D TP（2 CPU，R=2, C=4）</td><td>9–11</td><td>3.0–3.7&times;</td></tr>
+  <tr><td style="font-weight:500;">双 Domain 3D（4 CPU，2D TP + RDMA PP）</td><td style="font-weight:500;">14–18</td><td style="font-weight:500;">4.7–6.0&times;</td></tr>
+</table>
+
+
+
+<h2>七、与 report.pdf 的关系</h2>
+
+<div class="grid grid-2">
+  <div class="box box-purple">
+    <div class="box-title">report.pdf 2D TP（已有）</div>
+    适用：单个 Domain 内<br>
+    方法：QPI 行 + CXL 列 SUMMA<br>
+    覆盖：TP-1 + TP-2
+  </div>
+  <div class="box box-coral">
+    <div class="box-title">Feibric 扩展（原创）</div>
+    适用：两个 Domain 之间<br>
+    方法：RDMA 双缓冲流水线<br>
+    覆盖：PP 第三级
+  </div>
+</div>
+
+<p style="font-size:12px;color:#5F5E5A;margin-top:8px;">
+  Feibric 三级方案 = report.pdf 的 2D TP &times; 2 个 Domain &plus; RDMA 流水线。Domain 内的两级 TP 严格继承 report，Domain 间的 PP 是 Feibric 的增量贡献。
+</p>
+
+
+
+<h2>八、设计原则总结</h2>
+
+<table>
+  <tr><th style="width:30px;">#</th><th>原则</th><th>体现</th></tr>
+  <tr>
+    <td>1</td>
+    <td><strong>集合通信不离开 QPI</strong></td>
+    <td>R=2, C=4 保证每行全在同一 CPU 内；All-Gather、All-Reduce 在 QPI 域执行</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td><strong>通信量与链路带宽匹配</strong></td>
+    <td>高频大通信 &rarr; QPI（50 GB/s）；低频轻通信 &rarr; CXL（15 GB/s）；极稀疏通信 &rarr; RDMA</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td><strong>并行度不超过物理边界</strong></td>
+    <td>C=4 = 每 CPU NUMA 数；R=2 = Domain CPU 数；PP stage=2 = Domain 数</td>
+  </tr>
+  <tr>
+    <td>4</td>
+    <td><strong>传输隐藏在计算中</strong></td>
+    <td>RDMA 双缓冲，5 us 传输被下一 token 的 Layer 0 计算覆盖（~150 us）</td>
+  </tr>
+</table>

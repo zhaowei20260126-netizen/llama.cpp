@@ -584,6 +584,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ALL_REDUCE_SUM,
+
         GGML_OP_COUNT,
     };
 
@@ -1276,6 +1278,14 @@ extern "C" {
              struct ggml_tensor * a,
              enum ggml_glu_op     op,
              bool                 swapped);
+
+    GGML_API void ggml_tp_shm_init(int rank, int size, void * shm_base, size_t shm_size);
+
+    GGML_API void ggml_tp_print_stats(const char * prefix, const char * role);
+
+    GGML_API struct ggml_tensor * ggml_all_reduce_sum(
+            struct ggml_context * ctx,
+             struct ggml_tensor * a);
 
     GGML_API struct ggml_tensor * ggml_reglu(
             struct ggml_context * ctx,

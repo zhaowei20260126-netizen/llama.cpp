@@ -2023,6 +2023,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_ALL_REDUCE_SUM:
+            {
+                ggml_compute_forward_all_reduce_sum(params, tensor);
+            } break;
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
@@ -2386,6 +2390,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_GET_REL_POS:
             {
                 n_tasks = 1;
+            } break;
+        case GGML_OP_ALL_REDUCE_SUM:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
