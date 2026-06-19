@@ -2278,6 +2278,7 @@ static int run_head(const pipeline_args & args, Transport & transport) {
     llama_batch batch = llama_batch_init(max_micro_batch_tokens(args), 0, 1);
     const int64_t n_total_prompt = (int64_t) prompt_tokens.size() * args.parallel;
     const int64_t n_total_gen = (int64_t) args.n_predict * args.parallel;
+    int64_t n_gen_read = 0;
 
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
@@ -2333,6 +2334,7 @@ static int run_head(const pipeline_args & args, Transport & transport) {
             llama_token token = 0;
             try {
                 token = read_token_for_seq(transport, seq_id, pending_tokens);
+                ++n_gen_read;
             } catch (const std::exception & e) {
                 fprintf(stderr, "pipeline-brick head: %s\n", e.what());
                 return 3;
@@ -2375,6 +2377,7 @@ static int run_head(const pipeline_args & args, Transport & transport) {
     for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
         try {
             (void) read_token_for_seq(transport, seq_id, pending_tokens);
+            ++n_gen_read;
         } catch (const std::exception & e) {
             fprintf(stderr, "pipeline-brick head: %s\n", e.what());
             return 3;
@@ -2389,6 +2392,8 @@ static int run_head(const pipeline_args & args, Transport & transport) {
                 (long long) n_total_prompt, n_total_prompt / infer_s);
         fprintf(stderr, "pipeline-brick perf: total gen tokens %lld, speed %.2f t/s\n",
                 (long long) n_total_gen, n_total_gen / infer_s);
+        fprintf(stderr, "pipeline-brick perf: measured gen tokens %lld / target %lld\n",
+                (long long) n_gen_read, (long long) n_total_gen);
         fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
                 (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
     }
@@ -2440,6 +2445,8 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
 
     llama_batch batch = llama_batch_init(max_micro_batch_tokens(args), n_embd, 1);
     std::vector<std::string> outputs(args.parallel);
+    const int64_t n_target_gen = (int64_t) args.n_predict * args.parallel;
+    int64_t n_gen_sent = 0;
 
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
@@ -2504,6 +2511,7 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
             if (meta.flags & PIPELINE_FLAG_WANT_LOGITS) {
                 llama_token token = greedy_sample(ctx, vocab, i);
                 transport.send_token(meta.seq_id, token);
+                ++n_gen_sent;
                 const std::string piece = common_token_to_piece(vocab, token, false);
                 outputs[meta.seq_id] += piece;
             }
@@ -2515,6 +2523,8 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
             printf("[seq %d] %s\n", seq_id, outputs[seq_id].c_str());
         }
         fflush(stdout);
+        fprintf(stderr, "pipeline-brick tail: measured sent gen tokens %lld / target %lld\n",
+                (long long) n_gen_sent, (long long) n_target_gen);
     }
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
