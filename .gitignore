@@ -149,6 +149,33 @@ flake.lock
 /run-spec.sh
 /.ccache/
 
+# Private submission artifacts
+
+/*.docx
+/*.pdf
+/*.pptx
+/*.xlsx
+/*.html
+/*.txt
+/test_config.toml
+/bench-logs/
+/logs/
+/experiments/
+/progress/
+/prompts/
+/AGENTS.md
+/CLAUDE.md
+/.gemini/
+/.pi/
+/docs/pipeline-brick*.md
+/docs/competition-*.md
+/docs/feibric-*.md
+/docs/local-*-benchmark.md
+/docs/next-codex-*.md
+/tools/pipeline-brick/CXL_PIPELINE_USAGE.txt
+/tools/pipeline-brick/*.bak
+/tp/TP_MODIFICATION_GUIDE.txt
+
 # IDE
 
 /*.code-workspace
