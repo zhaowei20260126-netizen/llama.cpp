@@ -51,9 +51,9 @@ static constexpr uint32_t PIPELINE_FLAG_DECODE       = 1u << 4;
 static constexpr uint32_t PIPELINE_SLOT_EMPTY        = 0;
 static constexpr uint32_t PIPELINE_SLOT_FULL         = 1;
 static constexpr uint32_t PIPELINE_N_SLOTS           = 64;
-static constexpr int32_t  QWEN3_4B_N_LAYER           = 36;
-static constexpr int32_t  QWEN3_4B_N_EMBD            = 2560;
-static constexpr int32_t  QWEN3_4B_SPLIT_LAYER       = 18;
+// Default model geometry (Qwen3-4B). Override with --n-layer / --n-embd for other models.
+static constexpr int32_t  DEFAULT_N_LAYER            = 36;
+static constexpr int32_t  DEFAULT_N_EMBD             = 2560;
 
 static const char * PIPELINE_PARALLEL_SYSTEM_PROMPT =
 R"(Transcript of a never ending dialog, where the User interacts with an Assistant.
@@ -137,6 +137,8 @@ struct pipeline_args {
     int32_t tp_rank       = 0;
     int32_t tp_size       = 1;
     int32_t prefill_chunk = 32;
+    int32_t n_layer       = DEFAULT_N_LAYER;  // 0 = read from model at runtime
+    int32_t n_embd_arg    = DEFAULT_N_EMBD;   // 0 = read from model at runtime
     int32_t stream_kv_sink   = 16;
     int32_t stream_kv_recent = 128;
     int32_t rdma_port = 1;
@@ -277,10 +279,21 @@ static int32_t max_micro_batch_tokens(const pipeline_args & args) {
     return std::max(args.parallel, args.parallel * args.prefill_chunk);
 }
 
+// Effective model geometry. n_layer/n_embd_arg=0 means "use default" (backward compat).
+static int32_t effective_n_layer(const pipeline_args & args) {
+    return args.n_layer > 0 ? args.n_layer : DEFAULT_N_LAYER;
+}
+static int32_t effective_n_embd(const pipeline_args & args) {
+    return args.n_embd_arg > 0 ? args.n_embd_arg : DEFAULT_N_EMBD;
+}
+static int32_t effective_split_layer(const pipeline_args & args) {
+    return effective_n_layer(args) / 2;
+}
+
 static size_t max_hidden_payload_bytes(const pipeline_args & args) {
     const size_t n_tokens = (size_t) max_micro_batch_tokens(args);
     return n_tokens * sizeof(hidden_token_meta) +
-        n_tokens * (size_t) QWEN3_4B_N_EMBD * hidden_dtype_size(args.hidden_type);
+        n_tokens * (size_t) effective_n_embd(args) * hidden_dtype_size(args.hidden_type);
 }
 
 class fd_handle {
@@ -1415,7 +1428,7 @@ static void print_usage(const char * prog) {
             "          --down-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
             "       %s --single-system --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
             "          --parallel N --head-numa 0-3 --tail-numa 4-7 [--prefill-chunk N]\n"
-            "          [--hidden-dtype bf16|f32] [--stream-kv]\n"
+            "          [--hidden-dtype bf16|f32] [--stream-kv] [--n-layer N] [--n-embd N]\n"
             "          [--stream-kv-sink N] [--stream-kv-recent N]\n"
             "          [--tp-size N] [--quiet] [--verbose]\n"
             "       %s --single-system --stage-count 4 --stage-numa '0-1;2-3;4-5;6-7'\n"
@@ -1556,6 +1569,10 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.numa_tp = std::stoi(need_value(key.c_str()));
         } else if (key == "--tp-size") {
             args.tp_size = std::stoi(need_value(key.c_str()));
+        } else if (key == "--n-layer") {
+            args.n_layer = std::stoi(need_value(key.c_str()));
+        } else if (key == "--n-embd") {
+            args.n_embd_arg = std::stoi(need_value(key.c_str()));
         } else if (key == "--numa-cpus") {
             args.numa_cpus = need_value(key.c_str());
         } else if (key == "--head-numa") {
@@ -2095,15 +2112,18 @@ static void validate_args(const pipeline_args & args) {
         }
         const bool layer_range_defaulted = stage_mode && args.layer_start < 0 && args.layer_end < 0;
         if (!layer_range_defaulted &&
-                (args.layer_start < 0 || args.layer_end <= args.layer_start || args.layer_end > QWEN3_4B_N_LAYER)) {
+                (args.layer_start < 0 || args.layer_end <= args.layer_start || args.layer_end > effective_n_layer(args))) {
             throw std::runtime_error("invalid --layer-start/--layer-end");
         }
         if (!stage_mode) {
-            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && (args.layer_start != 0 || args.layer_end != QWEN3_4B_SPLIT_LAYER)) {
-                throw std::runtime_error("head must use --layer-start 0 --layer-end 18 for Qwen3-4B");
+            const int32_t n_layer = effective_n_layer(args);
+            const int32_t split = effective_split_layer(args);
+            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && (args.layer_start != 0 || args.layer_end != split)) {
+                throw std::runtime_error("head must use --layer-start 0 --layer-end " + std::to_string(split));
             }
-            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_TAIL && (args.layer_start != QWEN3_4B_SPLIT_LAYER || args.layer_end != QWEN3_4B_N_LAYER)) {
-                throw std::runtime_error("tail must use --layer-start 18 --layer-end 36 for Qwen3-4B");
+            if (args.role == LLAMA_PIPELINE_BRICK_ROLE_TAIL && (args.layer_start != split || args.layer_end != n_layer)) {
+                throw std::runtime_error("tail must use --layer-start " + std::to_string(split) +
+                                         " --layer-end " + std::to_string(n_layer));
             }
         }
     }
@@ -2303,8 +2323,8 @@ static int run_head(const pipeline_args & args, Transport & transport) {
     }
 
     const int32_t n_embd = llama_model_n_embd(model);
-    if (n_embd != QWEN3_4B_N_EMBD) {
-        fprintf(stderr, "pipeline-brick head: expected n_embd=%d, got %d\n", QWEN3_4B_N_EMBD, n_embd);
+    if (n_embd != effective_n_embd(args)) {
+        fprintf(stderr, "pipeline-brick head: expected n_embd=%d, got %d (use --n-embd to override)\n", effective_n_embd(args), n_embd);
         return 2;
     }
 
@@ -2483,8 +2503,8 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
     llama_context * ctx = make_context(model, args, false);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     const int32_t n_embd = llama_model_n_embd(model);
-    if (n_embd != QWEN3_4B_N_EMBD) {
-        fprintf(stderr, "pipeline-brick tail: expected n_embd=%d, got %d\n", QWEN3_4B_N_EMBD, n_embd);
+    if (n_embd != effective_n_embd(args)) {
+        fprintf(stderr, "pipeline-brick tail: expected n_embd=%d, got %d (use --n-embd to override)\n", effective_n_embd(args), n_embd);
         return 2;
     }
 
@@ -2616,8 +2636,8 @@ static int run_middle_stage(const pipeline_args & args, Upstream & upstream, Dow
 
     llama_context * ctx = make_context(model, args, true);
     const int32_t n_embd = llama_model_n_embd(model);
-    if (n_embd != QWEN3_4B_N_EMBD) {
-        fprintf(stderr, "pipeline-brick stage%d: expected n_embd=%d, got %d\n", args.stage_id, QWEN3_4B_N_EMBD, n_embd);
+    if (n_embd != effective_n_embd(args)) {
+        fprintf(stderr, "pipeline-brick stage%d: expected n_embd=%d, got %d (use --n-embd to override)\n", args.stage_id, effective_n_embd(args), n_embd);
         return 2;
     }
 
@@ -2923,7 +2943,7 @@ static size_t tp_broadcast_size(const pipeline_args & args) {
 }
 
 static size_t tp_all_reduce_size(const pipeline_args & args) {
-    const size_t max_elements = (size_t) QWEN3_4B_N_EMBD * (size_t) max_micro_batch_tokens(args);
+    const size_t max_elements = (size_t) effective_n_embd(args) * (size_t) max_micro_batch_tokens(args);
     return align_up(sizeof(uint64_t) * 8, 64) + max_elements * sizeof(float) * (size_t) args.tp_size + 65536;
 }
 
@@ -3033,9 +3053,10 @@ static pipeline_args normalize_stage_args(const pipeline_args & args) {
         throw std::runtime_error("--stage-id must be in [0, stage-count)");
     }
     if (out.layer_start < 0 && out.layer_end < 0) {
-        const int layers_per_stage = QWEN3_4B_N_LAYER / out.stage_count;
+        const int n_layer = effective_n_layer(args);
+        const int layers_per_stage = n_layer / out.stage_count;
         out.layer_start = out.stage_id * layers_per_stage;
-        out.layer_end = out.stage_id == out.stage_count - 1 ? QWEN3_4B_N_LAYER : out.layer_start + layers_per_stage;
+        out.layer_end = out.stage_id == out.stage_count - 1 ? n_layer : out.layer_start + layers_per_stage;
     }
     if (out.role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
         if (out.stage_id == 0) {
@@ -3243,15 +3264,15 @@ static pipeline_args make_single_system_child_args(
         child.brick_id = 0;
         child.peer_brick_id = 1;
         child.layer_start = 0;
-        child.layer_end = QWEN3_4B_SPLIT_LAYER;
+        child.layer_end = effective_split_layer(args);
         child.numa_cpus = cpus_for_numa_nodes(args.head_numa);
         child.tx_mw = h2t_path;
         child.rx_mw = t2h_path;
     } else {
         child.brick_id = 1;
         child.peer_brick_id = 0;
-        child.layer_start = QWEN3_4B_SPLIT_LAYER;
-        child.layer_end = QWEN3_4B_N_LAYER;
+        child.layer_start = effective_split_layer(args);
+        child.layer_end = effective_n_layer(args);
         child.numa_cpus = cpus_for_numa_nodes(args.tail_numa);
         child.tx_mw = t2h_path;
         child.rx_mw = h2t_path;
