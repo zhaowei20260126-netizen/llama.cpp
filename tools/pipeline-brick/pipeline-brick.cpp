@@ -137,8 +137,8 @@ struct pipeline_args {
     int32_t tp_rank       = 0;
     int32_t tp_size       = 1;
     int32_t prefill_chunk = 32;
-    int32_t n_layer       = DEFAULT_N_LAYER;  // 0 = read from model at runtime
-    int32_t n_embd_arg    = DEFAULT_N_EMBD;   // 0 = read from model at runtime
+    int32_t n_layer       = DEFAULT_N_LAYER;  // override via --n-layer for non-default models
+    int32_t n_embd_arg    = DEFAULT_N_EMBD;   // override via --n-embd for non-default models
     int32_t stream_kv_sink   = 16;
     int32_t stream_kv_recent = 128;
     int32_t rdma_port = 1;
@@ -279,7 +279,7 @@ static int32_t max_micro_batch_tokens(const pipeline_args & args) {
     return std::max(args.parallel, args.parallel * args.prefill_chunk);
 }
 
-// Effective model geometry. n_layer/n_embd_arg=0 means "use default" (backward compat).
+// Effective model geometry. Values <=0 fall back to the Qwen3-4B default.
 static int32_t effective_n_layer(const pipeline_args & args) {
     return args.n_layer > 0 ? args.n_layer : DEFAULT_N_LAYER;
 }
@@ -2118,6 +2118,11 @@ static void validate_args(const pipeline_args & args) {
         if (!stage_mode) {
             const int32_t n_layer = effective_n_layer(args);
             const int32_t split = effective_split_layer(args);
+            if (n_layer % 2 != 0) {
+                fprintf(stderr,
+                        "pipeline-brick: n_layer=%d is odd, Head/Tail split is uneven (%d vs %d layers)\n",
+                        n_layer, split, n_layer - split);
+            }
             if (args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && (args.layer_start != 0 || args.layer_end != split)) {
                 throw std::runtime_error("head must use --layer-start 0 --layer-end " + std::to_string(split));
             }
@@ -2387,8 +2392,8 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
         {
             pipe_timer _t(g_pipe_prof.cxl_send_us);
-            transport.send_hidden_payload((int32_t) offset, batch.n_tokens, n_embd, flags, payload.data(), payload.size());
             g_pipe_prof.cxl_send_calls++;
+            transport.send_hidden_payload((int32_t) offset, batch.n_tokens, n_embd, flags, payload.data(), payload.size());
         }
         if (!args.quiet) {
             fprintf(stderr, "pipeline-brick head: sent prefill pos=%zu n_tokens=%d bytes=%zu dtype=%s\n",
@@ -2442,8 +2447,8 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
         {
             pipe_timer _t(g_pipe_prof.cxl_send_us);
-            transport.send_hidden_payload(decode_pos, batch.n_tokens, n_embd, flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE, payload.data(), payload.size());
             g_pipe_prof.cxl_send_calls++;
+            transport.send_hidden_payload(decode_pos, batch.n_tokens, n_embd, flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE, payload.data(), payload.size());
         }
         if (!args.quiet) {
             fprintf(stderr, "pipeline-brick head: sent decode pos=%d n_tokens=%d bytes=%zu dtype=%s\n",
@@ -2531,11 +2536,17 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
     }
 
     const int64_t t_infer_start = ggml_time_us();
+    bool first_packet = true;
     while (true) {
         int64_t rw0 = ggml_time_us();
         recv_packet packet = transport.recv();
-        g_pipe_prof.wait_recv_us += ggml_time_us() - rw0;
-        g_pipe_prof.wait_recv_calls++;
+        // First recv blocks while head loads model + runs first prefill; that is
+        // head startup latency, not a pipeline bubble, so exclude it from wait_recv.
+        if (!first_packet) {
+            g_pipe_prof.wait_recv_us += ggml_time_us() - rw0;
+            g_pipe_prof.wait_recv_calls++;
+        }
+        first_packet = false;
         const brick_packet_header & header = packet.header;
         if (header.flags & PIPELINE_FLAG_STOP) {
             break;
