@@ -174,3 +174,11 @@ AGENTS.local.md
 /docs/demo_video_script.md
 /docs/gen_socc_plan.py
 /docs/pipeline_tp_runtime_flow.svg
+
+# Feibric private markdown/html artifacts (legacy, removed from tree)
+
+/FEIBRIC_3D_SCHEME_FINAL.html
+/docs/feibric-real-machine-run-commands.md
+/docs/competition-technical-report-ppt-outline.md
+/progress/
+/prompts/codex-feibric-handoff-prompt.md
