@@ -1804,7 +1804,9 @@ static void bind_shared_window_to_numa(const std::string & path, size_t size, co
     }
 
     std::vector<unsigned long> mask = make_nodemask(nodes);
-    const unsigned long maxnode = (unsigned long) (*std::max_element(nodes.begin(), nodes.end()) + 1);
+    const int bits_per_word = (int) (sizeof(unsigned long) * CHAR_BIT);
+    const int max_node_id = *std::max_element(nodes.begin(), nodes.end());
+    const unsigned long maxnode = (unsigned long) ((max_node_id / bits_per_word + 1) * bits_per_word);
     const long rc = syscall(SYS_mbind, base, size, MPOL_BIND, mask.data(), maxnode, 0);
     if (rc != 0) {
         const int err = errno;
