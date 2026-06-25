@@ -186,3 +186,14 @@ AGENTS.local.md
 /Tang *.pdf
 /bench-logs/
 /logs/
+
+# Feibric private root-level artifacts (legacy, removed from tree)
+
+/llama.cpp_CPU*.docx
+/基于板间桥接*.docx
+/研电赛清单.pdf
+/输出信息.txt
+/experiments/
+/prompts/
+/report.pdf
+/test_config.toml
