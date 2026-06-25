@@ -16,7 +16,7 @@ The recommended mode is `--single-system`, which launches one head process and o
 - payload per generated or prompt token: `2560 * sizeof(float) = 10240` bytes.
 - scope: Qwen3-4B GGUF only, CPU-only.
 
-Important limitation: `--numa-tp` is currently a runtime configuration and affinity check in this tool. llama.cpp's CPU backend does not yet expose true CPU-NUMA tensor-parallel devices, so Q4_K_M matrix sharding across NUMA nodes still needs backend work before it is a real tensor split.
+Important limitation: `--numa-tp` is a NUMA-span info label only (logged in head/tail output). NUMA-aware tensor parallelism is provided by `--tp-size` (process-level TP with per-rank NUMA binding); single-process tensor-level NUMA split is not implemented.
 
 ## Build
 

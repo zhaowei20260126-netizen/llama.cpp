@@ -3127,11 +3127,8 @@ static int run_hardware(const pipeline_args & args) {
         return run_hardware_tp(args);
     }
 
-    if (args.numa_tp > 1) {
-        fprintf(stderr,
-                "pipeline-brick numa: requested numa_tp=%d. This build binds CPU affinity; true CPU-NUMA tensor split still needs backend support.\n",
-                args.numa_tp);
-    }
+    // ponytail: numa_tp is a NUMA-span info label only (logged in head/tail);
+    // NUMA-aware TP is provided by --tp-size. No single-process tensor-level split.
 
     if (args.transport == transport_kind::cxl) {
         cxl_transport transport = cxl_transport::open_transport(args, max_payload_bytes);
