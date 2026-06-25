@@ -3,10 +3,12 @@
 ## Project Memory
 
 - 默认用中文回答。
-- Feibric 项目后续默认只使用 F16 模型和 F16/BF16 权重路径，不再使用 Q4_K_M 或其他 4-bit 量化模型作为主实验路径。
-- 生成构建、运行、测试命令时，优先使用 `models/qwen3-4b-f16/Qwen3-4B-Instruct-2507-F16.gguf`，不要再默认给 Q4 模型命令。
-- TP、pipeline、CXL/RDMA、stream-kv 后续都以 F16 模型为统一口径，除非用户明确要求 Q4 对照实验。
-
+- 回答中肯，而非附和，不要认为我清楚我的问题。
+协作硬规则：
+1、禁止自作主张做“最小化实现”而忽略用户设计要求。必须按用户确认的目标架构最大努力完成。
+2、禁止过度保守。用户提出提高效率、多个 worktree 并行推进时，必须给出可行、清晰的并行方案。
+3、禁止未讨论充分就直接改代码。架构和模块设计未确认前，只做文档讨论和设计沉淀。
+4、表达要直接陈述，避免使用“不是 xxx，而是 xxx”这种句式。
 > [!IMPORTANT]
 > This project does **not** accept pull requests that are fully or predominantly AI-generated. AI tools may be utilized solely in an assistive capacity.
 >
