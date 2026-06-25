@@ -1898,6 +1898,50 @@ static std::vector<uint64_t> read_numa_maps_pages() {
     return pages_by_node;
 }
 
+// Pipeline profiler: six-dimension breakdown for paper 4.3 performance attribution.
+// compute = total - cxl_send - wait_recv - tp_reduce (residual: matmul+attn+mem+misc).
+struct pipeline_profiler {
+    int64_t cxl_send_us = 0;   // inter-brick hidden-state transfer time
+    int64_t wait_recv_us = 0;  // pipeline bubble: blocked waiting on peer
+    int64_t cxl_send_calls = 0;
+    int64_t wait_recv_calls = 0;
+};
+
+static pipeline_profiler g_pipe_prof;
+
+struct pipe_timer {
+    int64_t & acc;
+    int64_t t0;
+    explicit pipe_timer(int64_t & a) : acc(a), t0(ggml_time_us()) {}
+    ~pipe_timer() { acc += ggml_time_us() - t0; }
+};
+
+// Six-dimension breakdown for paper 4.3. Percentages of end-to-end infer time.
+// Each TP rank prints its own (g_pipe_prof and tp stats are per-process after fork).
+static void print_pipeline_profile(const pipeline_args & args, double infer_s) {
+    const int64_t total_us = (int64_t)(infer_s * 1e6);
+    if (total_us <= 0) {
+        return;
+    }
+    const int64_t cxl_us    = g_pipe_prof.cxl_send_us;
+    const int64_t wait_us   = g_pipe_prof.wait_recv_us;
+    const int64_t reduce_us = ggml_tp_total_us();
+    const int64_t compute_us = total_us - cxl_us - wait_us - reduce_us;
+    const auto pct = [&](int64_t v) { return (v < 0 ? 0 : v) * 100.0 / total_us; };
+    const char * rank_tag = args.tp_size > 1 ? "rank=" : "";
+
+    fprintf(stderr,
+            "pipeline-brick profile: role=%s %s%d total=%.2f ms | compute=%.1f%% cxl_send=%.1f%% wait_recv=%.1f%% tp_reduce=%.1f%%\n",
+            role_name(args.role).c_str(), rank_tag, args.tp_rank,
+            infer_s * 1000.0,
+            pct(compute_us), pct(cxl_us), pct(wait_us), pct(reduce_us));
+    fprintf(stderr,
+            "pipeline-brick profile: cxl_send calls=%lld us=%lld | wait_recv calls=%lld us=%lld | tp_reduce us=%lld\n",
+            (long long) g_pipe_prof.cxl_send_calls, (long long) cxl_us,
+            (long long) g_pipe_prof.wait_recv_calls, (long long) wait_us,
+            (long long) reduce_us);
+}
+
 static void print_numa_pages_line(
         const pipeline_args & args,
         const char * kind,
@@ -2218,7 +2262,10 @@ static llama_token read_token_for_seq(Transport & transport, int32_t seq_id, std
     }
 
     while (true) {
+        int64_t rw0 = ggml_time_us();
         recv_packet packet = transport.recv();
+        g_pipe_prof.wait_recv_us += ggml_time_us() - rw0;
+        g_pipe_prof.wait_recv_calls++;
         if (!(packet.header.flags & PIPELINE_FLAG_TOKEN) || packet.payload.size() != sizeof(token_payload)) {
             throw std::runtime_error("expected token packet on reverse channel");
         }
@@ -2318,7 +2365,11 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         }
 
         uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
-        transport.send_hidden_payload((int32_t) offset, batch.n_tokens, n_embd, flags, payload.data(), payload.size());
+        {
+            pipe_timer _t(g_pipe_prof.cxl_send_us);
+            transport.send_hidden_payload((int32_t) offset, batch.n_tokens, n_embd, flags, payload.data(), payload.size());
+            g_pipe_prof.cxl_send_calls++;
+        }
         if (!args.quiet) {
             fprintf(stderr, "pipeline-brick head: sent prefill pos=%zu n_tokens=%d bytes=%zu dtype=%s\n",
                     offset, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type));
@@ -2369,7 +2420,11 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         }
 
         uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
-        transport.send_hidden_payload(decode_pos, batch.n_tokens, n_embd, flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE, payload.data(), payload.size());
+        {
+            pipe_timer _t(g_pipe_prof.cxl_send_us);
+            transport.send_hidden_payload(decode_pos, batch.n_tokens, n_embd, flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE, payload.data(), payload.size());
+            g_pipe_prof.cxl_send_calls++;
+        }
         if (!args.quiet) {
             fprintf(stderr, "pipeline-brick head: sent decode pos=%d n_tokens=%d bytes=%zu dtype=%s\n",
                     decode_pos, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type));
@@ -2399,6 +2454,7 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
                 (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
     }
+    print_pipeline_profile(args, infer_s);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
     }
@@ -2454,8 +2510,12 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         llama_set_stream_kv_active(ctx, false);
     }
 
+    const int64_t t_infer_start = ggml_time_us();
     while (true) {
+        int64_t rw0 = ggml_time_us();
         recv_packet packet = transport.recv();
+        g_pipe_prof.wait_recv_us += ggml_time_us() - rw0;
+        g_pipe_prof.wait_recv_calls++;
         const brick_packet_header & header = packet.header;
         if (header.flags & PIPELINE_FLAG_STOP) {
             break;
@@ -2528,6 +2588,9 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         fprintf(stderr, "pipeline-brick tail: measured sent gen tokens %lld / target %lld\n",
                 (long long) n_gen_sent, (long long) n_target_gen);
     }
+    const int64_t t_infer_end = ggml_time_us();
+    const double infer_s = (t_infer_end - t_infer_start) / 1e6;
+    print_pipeline_profile(args, infer_s);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
     }

@@ -1283,6 +1283,9 @@ extern "C" {
 
     GGML_API void ggml_tp_print_stats(const char * prefix, const char * role);
 
+    // ponytail: total TP all-reduce time (copy+wait+reduce+wait_after) in us, for profiler breakdown.
+    GGML_API int64_t ggml_tp_total_us(void);
+
     GGML_API struct ggml_tensor * ggml_all_reduce_sum(
             struct ggml_context * ctx,
              struct ggml_tensor * a);

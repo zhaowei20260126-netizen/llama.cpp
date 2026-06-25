@@ -10090,6 +10090,11 @@ extern "C" void ggml_tp_shm_init(int rank, int size, void * shm_base, size_t shm
     g_tp_runtime.data_size = shm_size - data_offset;
 }
 
+extern "C" int64_t ggml_tp_total_us(void) {
+    return g_tp_stats.copy_us + g_tp_stats.wait_before_reduce_us +
+           g_tp_stats.reduce_us + g_tp_stats.wait_after_reduce_us;
+}
+
 extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
     if (g_tp_runtime.size <= 1 && g_tp_stats.calls == 0) {
         return;
