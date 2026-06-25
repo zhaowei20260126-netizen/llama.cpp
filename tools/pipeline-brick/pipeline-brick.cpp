@@ -2536,15 +2536,20 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
     }
 
     const int64_t t_infer_start = ggml_time_us();
+    int64_t first_recv_us = 0;
     bool first_packet = true;
     while (true) {
         int64_t rw0 = ggml_time_us();
         recv_packet packet = transport.recv();
+        const int64_t waited = ggml_time_us() - rw0;
         // First recv blocks while head loads model + runs first prefill; that is
-        // head startup latency, not a pipeline bubble, so exclude it from wait_recv.
+        // head startup latency, not a pipeline bubble, so exclude it from wait_recv
+        // and from the infer total (subtracted below).
         if (!first_packet) {
-            g_pipe_prof.wait_recv_us += ggml_time_us() - rw0;
+            g_pipe_prof.wait_recv_us += waited;
             g_pipe_prof.wait_recv_calls++;
+        } else {
+            first_recv_us = waited;
         }
         first_packet = false;
         const brick_packet_header & header = packet.header;
@@ -2620,7 +2625,7 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
                 (long long) n_gen_sent, (long long) n_target_gen);
     }
     const int64_t t_infer_end = ggml_time_us();
-    const double infer_s = (t_infer_end - t_infer_start) / 1e6;
+    const double infer_s = (t_infer_end - t_infer_start - first_recv_us) / 1e6;
     print_pipeline_profile(args, infer_s);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
