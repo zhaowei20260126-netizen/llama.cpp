@@ -163,25 +163,8 @@ AGENTS.local.md
 
 # Feibric private documents (not for public branches)
 
-/Feibric_SOCC_Evaluation.docx
-/Feibric-CBP_CPU*.docx
-/e探队-Feibric*.docx
-/eval/
-/docs/Feibric_SoCC_Sprint_Plan.docx
-/docs/Feibric_SoCC_*.docx
-/docs/final_experiment.md
-/docs/algorithm_code_snippets.md
-/docs/demo_video_script.md
-/docs/gen_socc_plan.py
-/docs/pipeline_tp_runtime_flow.svg
-
-# Feibric private markdown/html artifacts (legacy, removed from tree)
-
-/FEIBRIC_3D_SCHEME_FINAL.html
-/docs/feibric-real-machine-run-commands.md
-/docs/competition-technical-report-ppt-outline.md
-/progress/
-/prompts/codex-feibric-handoff-prompt.md
+/资料/
+/experiments/
 /Pipeline_Brick*.docx
 /Tang *.pdf
 /bench-logs/

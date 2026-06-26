@@ -30,9 +30,6 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
     const bool tp_has_layout = tp_enabled && ml.get_key("pipeline_brick.tp_layout", tp_layout, false);
 
     if (pipeline_brick) {
-        if (hparams.n_layer() != 36 || hparams.n_embd != 2560) {
-            throw std::runtime_error("pipeline-brick prototype only supports dense Qwen3-4B");
-        }
         if (params.pipeline_brick_role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
             throw std::runtime_error("pipeline-brick requires a role");
         }
@@ -51,7 +48,7 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
             if ((n_embd_head_k * n_head) % tp_size != 0 ||
                     n_embd_gqa % tp_size != 0 ||
                     n_ff % tp_size != 0) {
-                throw std::runtime_error("Qwen3-4B dimensions are not divisible by pipeline-brick TP size");
+                throw std::runtime_error("Qwen3 dimensions are not divisible by pipeline-brick TP size");
             }
             if (tp_has_layout) {
                 if (!ml.get_key("pipeline_brick.tp_rank", tp_meta_rank, false) ||
@@ -73,7 +70,7 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader & ml) {
                 if (tp_meta_q_heads > (int32_t) n_head ||
                         tp_meta_kv_heads > (int32_t) n_head_kv ||
                         tp_meta_ffn > (int32_t) n_ff) {
-                    throw std::runtime_error("pipeline-brick TP metadata exceeds Qwen3-4B dimensions");
+                    throw std::runtime_error("pipeline-brick TP metadata exceeds Qwen3 dimensions");
                 }
                 if (tp_meta_q_heads % tp_meta_kv_heads != 0 ||
                         tp_meta_q_heads / tp_meta_kv_heads != (int32_t) (n_head / n_head_kv)) {
