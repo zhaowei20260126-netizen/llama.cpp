@@ -34,29 +34,81 @@ void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_llama::load_arch_tensors(llama_model_loader &) {
     LLAMA_LOAD_LOCALS;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    const bool pipeline_brick = params.pipeline_brick_enabled;
+    const bool pipeline_first = pipeline_brick && params.pipeline_brick_layer_start == 0;
+    const bool pipeline_last  = pipeline_brick && params.pipeline_brick_layer_end == (int32_t) hparams.n_layer();
+    const int32_t tp_rank = params.pipeline_brick_tp_rank;
+    const int32_t tp_size = params.pipeline_brick_tp_size;
+    const bool tp_enabled = tp_size > 1;
+
+    if (pipeline_brick) {
+        if (params.pipeline_brick_role == LLAMA_PIPELINE_BRICK_ROLE_NONE) {
+            throw std::runtime_error("pipeline-brick requires a role");
+        }
+        if (params.pipeline_brick_layer_start < 0 ||
+                params.pipeline_brick_layer_end > (int32_t) hparams.n_layer() ||
+                params.pipeline_brick_layer_start >= params.pipeline_brick_layer_end) {
+            throw std::runtime_error("invalid pipeline-brick layer range");
+        }
+        if (tp_enabled) {
+            if (tp_rank < 0 || tp_rank >= tp_size) {
+                throw std::runtime_error("invalid pipeline-brick TP rank");
+            }
+            if (tp_size != 2 && tp_size != 4) {
+                throw std::runtime_error("pipeline-brick TP prototype requires --tp-size 2 or 4");
+            }
+            if ((n_embd_head_k * n_head) % tp_size != 0 ||
+                    n_embd_k_gqa % tp_size != 0 ||
+                    n_ff % tp_size != 0) {
+                throw std::runtime_error("llama dimensions are not divisible by pipeline-brick TP size");
+            }
+        }
+    } else if (tp_enabled) {
+        throw std::runtime_error("pipeline-brick TP requires pipeline-brick mode");
+    }
+
+    const int64_t n_head_local    = tp_enabled ? n_head    / tp_size : n_head;
+    const int64_t n_head_kv_local = tp_enabled ? n_head_kv / tp_size : n_head_kv;
+    const int64_t n_embd_q_local  = n_embd_head_k * n_head_local;
+    const int64_t n_embd_kv_local = n_embd_head_k * n_head_kv_local;
+    const int64_t n_ff_local      = tp_enabled ? n_ff / tp_size : n_ff;
+
+    pipeline_brick_tp_q_heads_local  = (int32_t) n_head_local;
+    pipeline_brick_tp_kv_heads_local = (int32_t) n_head_kv_local;
+    pipeline_brick_tp_ffn_local      = (int32_t) n_ff_local;
+
+    if (!pipeline_brick || pipeline_first) {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+    } else {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    }
 
     // output
-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+    const int output_flags = pipeline_brick && !pipeline_last ? TENSOR_NOT_REQUIRED | TENSOR_SKIP : 0;
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, output_flags);
+    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED | output_flags);
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    if (output == NULL && (!pipeline_brick || pipeline_last)) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
     }
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+        const bool active_layer = !pipeline_brick ||
+            (i >= params.pipeline_brick_layer_start && i < params.pipeline_brick_layer_end);
+        const int layer_flags = active_layer ? 0 : TENSOR_NOT_REQUIRED | TENSOR_SKIP;
 
-        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, layer_flags);
+
+        create_tensor_qkv(layer, i, n_embd, n_embd_q_local, n_embd_kv_local, n_embd_kv_local, layer_flags);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_q_local, n_embd}, layer_flags);
 
         // optional bias tensors
         layer.wo_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
 
-        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, layer_flags);
 
         if (hparams.rope_scaling_type_train == LLAMA_ROPE_SCALING_TYPE_LONGROPE) {
             layer.rope_long  = create_tensor(tn(LLM_TENSOR_ROPE_FACTORS_LONG,  "weight", i), {n_rot/2}, TENSOR_NOT_REQUIRED | (i != 0 ? TENSOR_DUPLICATED : 0));
@@ -67,9 +119,9 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
         }
 
         if (n_expert == 0) {
-            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
-            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,      n_ff_local}, layer_flags);
+            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_local,  n_embd}, layer_flags);
+            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,      n_ff_local}, layer_flags);
 
             // optional MLP bias
             layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
@@ -102,6 +154,11 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
 
+    const bool pipeline_brick = model.pipeline_brick_enabled();
+    const int layer_start = pipeline_brick ? model.pipeline_brick_layer_start() : 0;
+    const int layer_end   = pipeline_brick ? model.pipeline_brick_layer_end()   : n_layer;
+    const bool pipeline_last  = pipeline_brick && layer_end == n_layer;
+
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
@@ -121,9 +178,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f/sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids = (!pipeline_brick || pipeline_last) ? build_inp_out_ids() : nullptr;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_start; il < layer_end; ++il) {
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -225,6 +282,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         inpL = cur;
     }
     cur = inpL;
+
+    if (pipeline_brick && !pipeline_last) {
+        res->t_embd = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur,
             model.output_norm, NULL,
