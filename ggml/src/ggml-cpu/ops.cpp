@@ -9996,6 +9996,7 @@ struct ggml_tp_stats {
     uint64_t elements;
     int64_t copy_us;
     int64_t wait_before_reduce_us;
+    int64_t sync_before_reduce_us;
     int64_t reduce_us;
     int64_t wait_after_reduce_us;
     int64_t last_end_us;
@@ -10008,6 +10009,7 @@ struct ggml_tp_slot_stats {
     uint64_t elements;
     int64_t copy_us;
     int64_t wait_before_reduce_us;
+    int64_t sync_before_reduce_us;
     int64_t reduce_us;
     int64_t wait_after_reduce_us;
     int64_t gap_before_us;
@@ -10092,7 +10094,8 @@ extern "C" void ggml_tp_shm_init(int rank, int size, void * shm_base, size_t shm
 
 extern "C" int64_t ggml_tp_total_us(void) {
     return g_tp_stats.copy_us + g_tp_stats.wait_before_reduce_us +
-           g_tp_stats.reduce_us + g_tp_stats.wait_after_reduce_us;
+           g_tp_stats.sync_before_reduce_us + g_tp_stats.reduce_us +
+           g_tp_stats.wait_after_reduce_us;
 }
 
 extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
@@ -10103,11 +10106,12 @@ extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
     const int64_t total_us =
         g_tp_stats.copy_us +
         g_tp_stats.wait_before_reduce_us +
+        g_tp_stats.sync_before_reduce_us +
         g_tp_stats.reduce_us +
         g_tp_stats.wait_after_reduce_us;
 
     fprintf(stderr,
-            "%s role=%s rank=%d/%d calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms total=%.3f ms\n",
+            "%s role=%s rank=%d/%d calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms sync_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms total=%.3f ms\n",
             prefix ? prefix : "ggml TP all-reduce:",
             role ? role : "unknown",
             g_tp_runtime.rank,
@@ -10116,6 +10120,7 @@ extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
             (unsigned long long) g_tp_stats.elements,
             (double) g_tp_stats.copy_us / 1000.0,
             (double) g_tp_stats.wait_before_reduce_us / 1000.0,
+            (double) g_tp_stats.sync_before_reduce_us / 1000.0,
             (double) g_tp_stats.reduce_us / 1000.0,
             (double) g_tp_stats.wait_after_reduce_us / 1000.0,
             (double) total_us / 1000.0);
@@ -10136,7 +10141,7 @@ extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
         }
 
         fprintf(stderr,
-                "%s role=%s rank=%d/%d slot=%d layer=%d phase=%s calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms gap_before=%.3f ms\n",
+                "%s role=%s rank=%d/%d slot=%d layer=%d phase=%s calls=%llu elements=%llu copy=%.3f ms wait_before_reduce=%.3f ms sync_before_reduce=%.3f ms reduce=%.3f ms wait_after_reduce=%.3f ms gap_before=%.3f ms\n",
                 slot_prefix,
                 role ? role : "unknown",
                 g_tp_runtime.rank,
@@ -10148,6 +10153,7 @@ extern "C" void ggml_tp_print_stats(const char * prefix, const char * role) {
                 (unsigned long long) s.elements,
                 (double) s.copy_us / 1000.0,
                 (double) s.wait_before_reduce_us / 1000.0,
+                (double) s.sync_before_reduce_us / 1000.0,
                 (double) s.reduce_us / 1000.0,
                 (double) s.wait_after_reduce_us / 1000.0,
                 (double) s.gap_before_us / 1000.0);
@@ -10262,6 +10268,7 @@ void ggml_compute_forward_all_reduce_sum(
         g_tp_stats.elements += (uint64_t) nelem;
         g_tp_stats.copy_us += t1 - t0;
         g_tp_stats.wait_before_reduce_us += t2 - t1;
+        g_tp_stats.sync_before_reduce_us += t3 - t2;
         g_tp_stats.reduce_us += t4 - t3;
         g_tp_stats.wait_after_reduce_us += t5 - t4;
         g_tp_stats.last_end_us = t5;
@@ -10271,6 +10278,7 @@ void ggml_compute_forward_all_reduce_sum(
         slot_stats.elements += (uint64_t) nelem;
         slot_stats.copy_us += t1 - t0;
         slot_stats.wait_before_reduce_us += t2 - t1;
+        slot_stats.sync_before_reduce_us += t3 - t2;
         slot_stats.reduce_us += t4 - t3;
         slot_stats.wait_after_reduce_us += t5 - t4;
         slot_stats.gap_before_us += gap_before;

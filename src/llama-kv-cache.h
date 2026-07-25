@@ -215,6 +215,21 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    struct numa_buffer_mapping {
+        void * addr = nullptr;
+        size_t size = 0;
+
+        numa_buffer_mapping() = default;
+        numa_buffer_mapping(void * addr, size_t size);
+        ~numa_buffer_mapping();
+
+        numa_buffer_mapping(const numa_buffer_mapping &) = delete;
+        numa_buffer_mapping & operator=(const numa_buffer_mapping &) = delete;
+
+        numa_buffer_mapping(numa_buffer_mapping && other) noexcept;
+        numa_buffer_mapping & operator=(numa_buffer_mapping && other) noexcept;
+    };
+
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -258,6 +273,9 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // NUMA mappings outlive the non-owning GGML buffers below.
+    std::vector<numa_buffer_mapping> numa_buffer_mappings;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

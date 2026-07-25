@@ -2275,6 +2275,7 @@ llama_model_params llama_model_default_params() {
         /*.pipeline_brick_layer_end    =*/ 0,
         /*.pipeline_brick_tp_rank      =*/ 0,
         /*.pipeline_brick_tp_size      =*/ 1,
+        /*.pipeline_brick_kv_numa_node =*/ -1,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
@@ -2326,6 +2327,14 @@ int32_t llama_model_n_head(const llama_model * model) {
 
 int32_t llama_model_n_head_kv(const llama_model * model) {
     return model->hparams.n_head_kv();
+}
+
+int32_t llama_model_n_embd_k_gqa(const llama_model * model, int32_t il) {
+    return model->hparams.n_embd_k_gqa(il);
+}
+
+int32_t llama_model_n_embd_v_gqa(const llama_model * model, int32_t il) {
+    return model->hparams.n_embd_v_gqa(il);
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {

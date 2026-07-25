@@ -42,12 +42,13 @@
 namespace {
 
 static constexpr uint32_t PIPELINE_BRICK_MAGIC       = 0x5042524b;
-static constexpr uint32_t PIPELINE_BRICK_VERSION     = 3;
+static constexpr uint32_t PIPELINE_BRICK_VERSION     = 4;
 static constexpr uint32_t PIPELINE_FLAG_WANT_LOGITS  = 1u << 0;
 static constexpr uint32_t PIPELINE_FLAG_STOP         = 1u << 1;
 static constexpr uint32_t PIPELINE_FLAG_TOKEN        = 1u << 2;
-static constexpr uint32_t PIPELINE_FLAG_HIDDEN_BF16  = 1u << 3;
+static constexpr uint32_t PIPELINE_FLAG_HIDDEN_F16   = 1u << 3;
 static constexpr uint32_t PIPELINE_FLAG_DECODE       = 1u << 4;
+static constexpr uint32_t PIPELINE_FLAG_TRAFFIC_ONLY = 1u << 5;
 static constexpr uint32_t PIPELINE_SLOT_EMPTY        = 0;
 static constexpr uint32_t PIPELINE_SLOT_FULL         = 1;
 static constexpr uint32_t PIPELINE_N_SLOTS           = 64;
@@ -84,7 +85,7 @@ enum class transport_kind {
 
 enum class hidden_dtype {
     f32,
-    bf16,
+    f16,
 };
 
 enum class domain_mode {
@@ -96,6 +97,7 @@ enum class domain_mode {
 struct pipeline_args {
     std::string model;
     std::string prompt;
+    std::string prompt_file;
     std::string tx_mw;
     std::string rx_mw;
     std::string tx_doorbell;
@@ -103,6 +105,7 @@ struct pipeline_args {
     std::string numa_cpus;
     std::string head_numa;
     std::string tail_numa;
+    std::string tail_kv_numa;
     std::string stage_numa;
     std::string up_tx_mw;
     std::string up_rx_mw;
@@ -137,6 +140,7 @@ struct pipeline_args {
     int32_t tp_rank       = 0;
     int32_t tp_size       = 1;
     int32_t prefill_chunk = 32;
+    int32_t pipeline_microbatch = 0;
     int32_t n_layer       = DEFAULT_N_LAYER;  // override via --n-layer for non-default models
     int32_t n_embd_arg    = DEFAULT_N_EMBD;   // override via --n-embd for non-default models
     int32_t stream_kv_sink   = 16;
@@ -145,7 +149,7 @@ struct pipeline_args {
     int32_t rdma_gid_index = 0;
     int32_t rdma_mtu = 1024;
 
-    hidden_dtype hidden_type = hidden_dtype::bf16;
+    hidden_dtype hidden_type = hidden_dtype::f16;
 
     bool hardware = false;
     bool single_system = false;
@@ -153,6 +157,11 @@ struct pipeline_args {
     bool verbose = false;
     bool quiet = false;
     bool stream_kv = false;
+    bool async_pipeline = false;
+    int32_t naive_transfer_mult = 1;  // 1=normal (hidden state only), >1=simulate naive pipeline that transfers N-1 extra copies of activation-size data per send
+    bool naive_kv_cross = false;      // simulate naive scenario: tail's KV cache is on peer CPU, every attention reads KV cross-CXL
+    int32_t naive_kv_cross_node = -1; // node where the simulated remote KV cache lives (peer CPU's node)
+    std::vector<std::string> async_prompts;
 };
 
 struct brick_packet_header {
@@ -252,7 +261,7 @@ static transport_kind parse_transport_kind(const std::string & value) {
 static const char * hidden_dtype_name(hidden_dtype type) {
     switch (type) {
         case hidden_dtype::f32:  return "f32";
-        case hidden_dtype::bf16: return "bf16";
+        case hidden_dtype::f16: return "f16";
     }
     return "unknown";
 }
@@ -260,7 +269,7 @@ static const char * hidden_dtype_name(hidden_dtype type) {
 static size_t hidden_dtype_size(hidden_dtype type) {
     switch (type) {
         case hidden_dtype::f32:  return sizeof(float);
-        case hidden_dtype::bf16: return sizeof(ggml_bf16_t);
+        case hidden_dtype::f16: return sizeof(ggml_fp16_t);
     }
     return sizeof(float);
 }
@@ -269,8 +278,8 @@ static hidden_dtype parse_hidden_dtype(const std::string & value) {
     if (value == "f32") {
         return hidden_dtype::f32;
     }
-    if (value == "bf16") {
-        return hidden_dtype::bf16;
+    if (value == "f16") {
+        return hidden_dtype::f16;
     }
     throw std::runtime_error("unknown --hidden-dtype: " + value);
 }
@@ -1409,7 +1418,9 @@ static void pipeline_brick_log_callback(ggml_log_level level, const char * text,
         const bool keep =
             level == GGML_LOG_LEVEL_ERROR ||
             contains(text, "llama_kv_cache: size =") ||
-            (contains(text, "llama_kv_cache:") && contains(text, "KV buffer size"));
+            (contains(text, "llama_kv_cache:") && contains(text, "KV buffer size")) ||
+            contains(text, "pipeline-brick KV NUMA") ||
+            contains(text, "verify_numa_buffer_pages:");
 
         if (!keep) {
             return;
@@ -1421,16 +1432,20 @@ static void pipeline_brick_log_callback(ggml_log_level level, const char * text,
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
-            "usage: %s --domain-mode single --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
+            "usage: %s --domain-mode single --model PATH --ctx-size N --threads N --n-predict N\n"
             "          --parallel N --head-numa 0-3 --tail-numa 4-7 [--tp-size 1|2|4]\n"
+            "          (--prompt TEXT | --async-pipeline --prompt-file PATH --pipeline-microbatch N)\n"
+            "          [--tail-kv-numa 0-3]\n"
             "       %s --domain-mode dual --stage-id N --stage-count 4 --model PATH --ctx-size N --threads N\n"
             "          --parallel N --numa-cpus CPU-RANGES --up-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
             "          --down-transport ntb-mw|cxl|ib-rdma|zni-rdma\n"
-            "       %s --single-system --model PATH --prompt TEXT --ctx-size N --threads N --n-predict N\n"
+            "       %s --single-system --model PATH --ctx-size N --threads N --n-predict N\n"
             "          --parallel N --head-numa 0-3 --tail-numa 4-7 [--prefill-chunk N]\n"
-            "          [--hidden-dtype bf16|f32] [--stream-kv] [--n-layer N] [--n-embd N]\n"
+            "          (--prompt TEXT | --async-pipeline --prompt-file PATH --pipeline-microbatch N)\n"
+            "          [--hidden-dtype f16|f32] [--stream-kv] [--n-layer N] [--n-embd N]\n"
             "          [--stream-kv-sink N] [--stream-kv-recent N]\n"
-            "          [--tp-size N] [--quiet] [--verbose]\n"
+            "          [--tp-size N] [--tail-kv-numa NODES] [--naive-transfer-mult N]\n"
+            "          [--naive-kv-cross [--naive-kv-cross-node N]] [--quiet] [--verbose]\n"
             "       %s --single-system --stage-count 4 --stage-numa '0-1;2-3;4-5;6-7'\n"
             "          --transport ntb-mw|cxl --model PATH --prompt TEXT --ctx-size N --threads N\n"
             "          --n-predict N --parallel N [--stream-kv] [--quiet] [--verbose]\n"
@@ -1444,8 +1459,8 @@ static void print_usage(const char * prog) {
             "          --numa-tp N --tp-size N --numa-cpus CPU-RANGES --transport ntb-mw|cxl\n"
             "          --tx-mw PATH --rx-mw PATH [--tx-doorbell PATH --rx-doorbell PATH]\n"
             "          [--doorbell-mode write|poll|ioctl] [--head-numa NODES --tail-numa NODES]\n"
-            "          [--prompt TEXT]\n"
-            "          [--prefill-chunk N] [--hidden-dtype bf16|f32] [--stream-kv]\n"
+            "          [--prompt TEXT | --async-pipeline --prompt-file PATH --pipeline-microbatch N]\n"
+            "          [--prefill-chunk N] [--hidden-dtype f16|f32] [--stream-kv]\n"
             "          [--stream-kv-sink N] [--stream-kv-recent N] [--quiet] [--verbose]\n"
             "       %s --self-test-ntb --role head|tail --brick-id N --peer-brick-id N\n"
             "          --transport ntb-mw --tx-mw PATH --rx-mw PATH\n",
@@ -1515,6 +1530,8 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.model = need_value(key.c_str());
         } else if (key == "--prompt" || key == "-p") {
             args.prompt = need_value(key.c_str());
+        } else if (key == "--prompt-file") {
+            args.prompt_file = need_value(key.c_str());
         } else if (key == "--role") {
             args.role = parse_role(need_value(key.c_str()));
         } else if (key == "--brick-id") {
@@ -1541,10 +1558,20 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.parallel = std::stoi(need_value(key.c_str()));
         } else if (key == "--prefill-chunk") {
             args.prefill_chunk = std::stoi(need_value(key.c_str()));
+        } else if (key == "--pipeline-microbatch") {
+            args.pipeline_microbatch = std::stoi(need_value(key.c_str()));
         } else if (key == "--hidden-dtype") {
             args.hidden_type = parse_hidden_dtype(need_value(key.c_str()));
+        } else if (key == "--async-pipeline") {
+            args.async_pipeline = true;
         } else if (key == "--stream-kv") {
             args.stream_kv = true;
+        } else if (key == "--naive-transfer-mult") {
+            args.naive_transfer_mult = std::stoi(need_value(key.c_str()));
+        } else if (key == "--naive-kv-cross") {
+            args.naive_kv_cross = true;
+        } else if (key == "--naive-kv-cross-node") {
+            args.naive_kv_cross_node = std::stoi(need_value(key.c_str()));
         } else if (key == "--stream-kv-sink") {
             args.stream_kv_sink = std::stoi(need_value(key.c_str()));
         } else if (key == "--stream-kv-recent") {
@@ -1579,6 +1606,8 @@ static pipeline_args parse_args(int argc, char ** argv) {
             args.head_numa = need_value(key.c_str());
         } else if (key == "--tail-numa") {
             args.tail_numa = need_value(key.c_str());
+        } else if (key == "--tail-kv-numa") {
+            args.tail_kv_numa = need_value(key.c_str());
         } else if (key == "--stage-numa") {
             args.stage_numa = need_value(key.c_str());
         } else if (key == "--transport") {
@@ -1842,6 +1871,30 @@ static void bind_shared_window_to_numa(const std::string & path, size_t size, co
     fprintf(stderr, "pipeline-brick numa: bound %s shared window to NUMA nodes %s\n", label, node_spec.c_str());
 }
 
+// Allocate an anonymous mmap region pinned to a single NUMA node via mbind.
+// node<0 means no binding (let the OS place it).
+static void * alloc_on_node(size_t bytes, int node) {
+    void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        fprintf(stderr, "alloc_on_node: mmap failed: %s\n", strerror(errno));
+        return nullptr;
+    }
+    if (node >= 0) {
+        const int bits_per_word = (int)(sizeof(unsigned long) * 8);
+        std::vector<unsigned long> mask((node / bits_per_word) + 1, 0);
+        mask[node / bits_per_word] |= 1UL << (node % bits_per_word);
+        const unsigned long maxnode = (unsigned long)mask.size() * bits_per_word;
+        const long rc = syscall(SYS_mbind, p, bytes, MPOL_BIND, mask.data(), maxnode, 0);
+        if (rc != 0) {
+            fprintf(stderr, "alloc_on_node: mbind(node=%d) failed: %s\n", node, strerror(errno));
+            munmap(p, bytes);
+            return nullptr;
+        }
+    }
+    memset(p, 0, bytes); // first-touch on the bound node
+    return p;
+}
+
 static void bind_to_cpus(const std::string & cpu_spec) {
     if (cpu_spec.empty()) {
         return;
@@ -1915,16 +1968,55 @@ static std::vector<uint64_t> read_numa_maps_pages() {
     return pages_by_node;
 }
 
-// Pipeline profiler: six-dimension breakdown for paper 4.3 performance attribution.
-// compute = total - cxl_send - wait_recv - tp_reduce (residual: matmul+attn+mem+misc).
+// Pipeline profiler: five-category breakdown for performance attribution.
+// compute is the residual after subtracting communication, waiting, TP, and
+// simulated KV traffic; it includes model compute and other local work.
 struct pipeline_profiler {
-    int64_t cxl_send_us = 0;   // inter-brick hidden-state transfer time
-    int64_t wait_recv_us = 0;  // pipeline bubble: blocked waiting on peer
+    int64_t cxl_send_us = 0;   // sender-visible enqueue/copy time, including slot backpressure
+    int64_t wait_recv_us = 0;  // blocking recv() wall time, including polling and payload copy
+    int64_t kv_cxl_read_us = 0; // naive-KV-cross: simulated cross-CXL KV cache read time
     int64_t cxl_send_calls = 0;
+    uint64_t cxl_send_bytes = 0;
     int64_t wait_recv_calls = 0;
+    int64_t kv_cxl_read_calls = 0;
+    uint64_t kv_cxl_read_bytes = 0;
 };
 
 static pipeline_profiler g_pipe_prof;
+
+// naive-kv-cross simulation: a buffer pinned to a peer-CPU node, read each decode
+// step to mimic a naive scenario where the brick's KV cache lives on the peer CPU
+// and every attention reads K/V cross-CXL. Size grows with current sequence length.
+static void * g_naive_kv_buf = nullptr;
+static size_t g_naive_kv_buf_size = 0;
+
+static void init_naive_kv_buf(int node, size_t max_bytes) {
+    if (max_bytes == 0) return;
+    g_naive_kv_buf = alloc_on_node(max_bytes, node);
+    if (g_naive_kv_buf) {
+        g_naive_kv_buf_size = max_bytes;
+    }
+}
+
+// Read `bytes` from the peer-pinned buffer, accumulate time into kv_cxl_read_us.
+// bytes = summed local K/V width across layers * cur_pos * n_sequences * elem_size.
+static void simulate_kv_cxl_read(
+        uint64_t n_kv_width, int32_t cur_pos, int32_t n_sequences) {
+    if (!g_naive_kv_buf || g_naive_kv_buf_size == 0) return;
+    const size_t elem_size = 2; // F16
+    size_t bytes = (size_t) n_kv_width * (size_t) cur_pos
+            * (size_t) n_sequences * elem_size;
+    if (bytes > g_naive_kv_buf_size) bytes = g_naive_kv_buf_size;
+    const int64_t t0 = ggml_time_us();
+    // read the bytes to pull them across CXL; volatile sink prevents elision
+    volatile uint8_t sink = 0;
+    const uint8_t * p = (const uint8_t *) g_naive_kv_buf;
+    for (size_t i = 0; i < bytes; i += 64) sink ^= p[i];
+    asm volatile("" :: "r"(sink) : "memory");
+    g_pipe_prof.kv_cxl_read_us += ggml_time_us() - t0;
+    g_pipe_prof.kv_cxl_read_calls++;
+    g_pipe_prof.kv_cxl_read_bytes += bytes;
+}
 
 struct pipe_timer {
     int64_t & acc;
@@ -1933,7 +2025,29 @@ struct pipe_timer {
     ~pipe_timer() { acc += ggml_time_us() - t0; }
 };
 
-// Six-dimension breakdown for paper 4.3. Percentages of end-to-end infer time.
+template<typename Transport>
+static void send_hidden_payload_profiled(
+        const pipeline_args & args,
+        Transport & transport,
+        int32_t pos,
+        int32_t n_tokens,
+        int32_t n_embd,
+        uint32_t flags,
+        const void * payload,
+        uint64_t payload_bytes) {
+    if (args.tp_size <= 1 || args.tp_rank == 0) {
+        pipe_timer timer(g_pipe_prof.cxl_send_us);
+        g_pipe_prof.cxl_send_calls++;
+        g_pipe_prof.cxl_send_bytes += payload_bytes;
+        transport.send_hidden_payload(
+                pos, n_tokens, n_embd, flags, payload, payload_bytes);
+        return;
+    }
+    transport.send_hidden_payload(
+            pos, n_tokens, n_embd, flags, payload, payload_bytes);
+}
+
+// Five-category breakdown. Percentages use the per-rank inference interval.
 // Each TP rank prints its own (g_pipe_prof and tp stats are per-process after fork).
 static void print_pipeline_profile(const pipeline_args & args, double infer_s) {
     const int64_t total_us = (int64_t)(infer_s * 1e6);
@@ -1943,20 +2057,69 @@ static void print_pipeline_profile(const pipeline_args & args, double infer_s) {
     const int64_t cxl_us    = g_pipe_prof.cxl_send_us;
     const int64_t wait_us   = g_pipe_prof.wait_recv_us;
     const int64_t reduce_us = ggml_tp_total_us();
-    const int64_t compute_us = total_us - cxl_us - wait_us - reduce_us;
+    const int64_t kvcxl_us  = g_pipe_prof.kv_cxl_read_us;
+    const int64_t compute_us = total_us - cxl_us - wait_us - reduce_us - kvcxl_us;
     const auto pct = [&](int64_t v) { return (v < 0 ? 0 : v) * 100.0 / total_us; };
     const char * rank_tag = args.tp_size > 1 ? "rank=" : "";
 
     fprintf(stderr,
-            "pipeline-brick profile: role=%s %s%d total=%.2f ms | compute=%.1f%% cxl_send=%.1f%% wait_recv=%.1f%% tp_reduce=%.1f%%\n",
+            "pipeline-brick profile: role=%s %s%d total=%.2f ms | compute=%.1f%% cxl_send=%.1f%% wait_recv=%.1f%% tp_reduce=%.1f%% kv_cxl_read=%.1f%%\n",
             role_name(args.role).c_str(), rank_tag, args.tp_rank,
             infer_s * 1000.0,
-            pct(compute_us), pct(cxl_us), pct(wait_us), pct(reduce_us));
+            pct(compute_us), pct(cxl_us), pct(wait_us), pct(reduce_us), pct(kvcxl_us));
     fprintf(stderr,
-            "pipeline-brick profile: cxl_send calls=%lld us=%lld | wait_recv calls=%lld us=%lld | tp_reduce us=%lld\n",
-            (long long) g_pipe_prof.cxl_send_calls, (long long) cxl_us,
+            "pipeline-brick profile: cxl_send calls=%lld bytes=%llu us=%lld | wait_recv calls=%lld us=%lld | tp_reduce us=%lld | kv_cxl_read calls=%lld bytes=%llu us=%lld\n",
+            (long long) g_pipe_prof.cxl_send_calls,
+            (unsigned long long) g_pipe_prof.cxl_send_bytes, (long long) cxl_us,
             (long long) g_pipe_prof.wait_recv_calls, (long long) wait_us,
-            (long long) reduce_us);
+            (long long) reduce_us, (long long) g_pipe_prof.kv_cxl_read_calls,
+            (unsigned long long) g_pipe_prof.kv_cxl_read_bytes, (long long) kvcxl_us);
+}
+
+struct pipeline_profile_snapshot {
+    int64_t wall_us;
+    int64_t cxl_send_us;
+    int64_t wait_recv_us;
+    int64_t tp_reduce_us;
+    int64_t kv_cxl_read_us;
+};
+
+static pipeline_profile_snapshot capture_pipeline_profile() {
+    return {
+        ggml_time_us(),
+        g_pipe_prof.cxl_send_us,
+        g_pipe_prof.wait_recv_us,
+        ggml_tp_total_us(),
+        g_pipe_prof.kv_cxl_read_us,
+    };
+}
+
+static void print_pipeline_phase_profile(
+        const pipeline_args & args,
+        const char * phase,
+        const pipeline_profile_snapshot & begin,
+        const pipeline_profile_snapshot & end) {
+    const int64_t total_us  = end.wall_us - begin.wall_us;
+    if (total_us <= 0) {
+        return;
+    }
+    const int64_t cxl_us    = end.cxl_send_us - begin.cxl_send_us;
+    const int64_t wait_us   = end.wait_recv_us - begin.wait_recv_us;
+    const int64_t reduce_us = end.tp_reduce_us - begin.tp_reduce_us;
+    const int64_t kvcxl_us  = end.kv_cxl_read_us - begin.kv_cxl_read_us;
+    const int64_t compute_us = total_us - cxl_us - wait_us - reduce_us - kvcxl_us;
+    const auto pct = [&](int64_t v) { return (v < 0 ? 0 : v) * 100.0 / total_us; };
+    const char * rank_tag = args.tp_size > 1 ? "rank=" : "";
+
+    fprintf(stderr,
+            "pipeline-brick phase-profile: phase=%s role=%s %s%d total=%.2f ms | compute=%.1f%% cxl_send=%.1f%% wait_recv=%.1f%% tp_reduce=%.1f%% kv_cxl_read=%.1f%%\n",
+            phase, role_name(args.role).c_str(), rank_tag, args.tp_rank,
+            total_us / 1000.0,
+            pct(compute_us), pct(cxl_us), pct(wait_us), pct(reduce_us), pct(kvcxl_us));
+    fprintf(stderr,
+            "pipeline-brick phase-profile: phase=%s cxl_send us=%lld | wait_recv us=%lld | tp_reduce us=%lld | kv_cxl_read us=%lld\n",
+            phase, (long long) cxl_us, (long long) wait_us,
+            (long long) reduce_us, (long long) kvcxl_us);
 }
 
 static void print_numa_pages_line(
@@ -1989,6 +2152,18 @@ static void print_numa_pages_line(
     fprintf(stderr, " total=%" PRIu64 " total_mib=%.1f\n", total_pages, mib);
 }
 
+static int tail_kv_numa_node(const pipeline_args & args) {
+    if (args.role != LLAMA_PIPELINE_BRICK_ROLE_TAIL || args.tail_kv_numa.empty()) {
+        return -1;
+    }
+
+    const std::vector<int> nodes = parse_cpu_list_ordered(args.tail_kv_numa);
+    if (args.tp_rank < 0 || args.tp_rank >= (int32_t) nodes.size()) {
+        throw std::runtime_error("Tail TP rank has no matching --tail-kv-numa node");
+    }
+    return nodes[args.tp_rank];
+}
+
 static bool stage_mode_enabled(const pipeline_args & args);
 
 static void apply_domain_mode_defaults(pipeline_args & args) {
@@ -2004,6 +2179,33 @@ static void apply_domain_mode_defaults(pipeline_args & args) {
                 args.stage_count = 4;
             }
             break;
+    }
+}
+
+static void prepare_async_prompts(pipeline_args & args) {
+    if (!args.async_pipeline || args.prompt_file.empty()) {
+        return;
+    }
+
+    std::ifstream input(args.prompt_file);
+    if (!input) {
+        throw std::runtime_error("failed to open --prompt-file: " + args.prompt_file);
+    }
+
+    std::string line;
+    int32_t line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            throw std::runtime_error("--prompt-file contains an empty prompt at line " + std::to_string(line_number));
+        }
+        args.async_prompts.push_back(std::move(line));
+    }
+    if (!input.eof()) {
+        throw std::runtime_error("failed while reading --prompt-file: " + args.prompt_file);
     }
 }
 
@@ -2041,6 +2243,72 @@ static void validate_args(const pipeline_args & args) {
     if (args.tp_size != 1 && args.tp_size != 2 && args.tp_size != 4) {
         throw std::runtime_error("pipeline-brick TP prototype supports only --tp-size 1, 2, or 4");
     }
+    if (args.ctx_size <= 0) {
+        throw std::runtime_error("--ctx-size must be positive");
+    }
+    if (args.threads <= 0) {
+        throw std::runtime_error("--threads must be positive");
+    }
+    if (args.naive_transfer_mult <= 0) {
+        throw std::runtime_error("--naive-transfer-mult must be positive");
+    }
+    if (!args.tail_kv_numa.empty()) {
+        if (!args.single_system || stage_mode) {
+            throw std::runtime_error("--tail-kv-numa is supported only in single-system Head/Tail mode");
+        }
+        if (args.naive_kv_cross) {
+            throw std::runtime_error("--tail-kv-numa cannot be combined with --naive-kv-cross");
+        }
+        std::vector<int> nodes;
+        try {
+            nodes = parse_cpu_list_ordered(args.tail_kv_numa);
+        } catch (const std::exception &) {
+            throw std::runtime_error("--tail-kv-numa contains an invalid or negative NUMA node");
+        }
+        if ((int32_t) nodes.size() != args.tp_size) {
+            throw std::runtime_error("--tail-kv-numa must contain exactly --tp-size NUMA nodes");
+        }
+        for (int node : nodes) {
+            if (node < 0) {
+                throw std::runtime_error("--tail-kv-numa node ids must be non-negative");
+            }
+        }
+        std::vector<int> unique_nodes = nodes;
+        std::sort(unique_nodes.begin(), unique_nodes.end());
+        if (std::adjacent_find(unique_nodes.begin(), unique_nodes.end()) != unique_nodes.end()) {
+            throw std::runtime_error("--tail-kv-numa must not contain duplicate NUMA nodes");
+        }
+    }
+    if (args.async_pipeline) {
+        if (args.prompt_file.empty()) {
+            throw std::runtime_error("--async-pipeline requires --prompt-file");
+        }
+        if (!args.prompt.empty()) {
+            throw std::runtime_error("--async-pipeline cannot be combined with --prompt");
+        }
+        if (args.pipeline_microbatch <= 0 || args.pipeline_microbatch > args.parallel) {
+            throw std::runtime_error("--pipeline-microbatch must be between 1 and --parallel");
+        }
+        if ((int32_t) args.async_prompts.size() != args.parallel) {
+            throw std::runtime_error("--prompt-file must contain exactly --parallel non-empty lines");
+        }
+        if (args.parallel > (int32_t) PIPELINE_N_SLOTS) {
+            throw std::runtime_error("--async-pipeline requires --parallel <= 64");
+        }
+        if (args.stream_kv) {
+            throw std::runtime_error("--async-pipeline cannot be combined with --stream-kv");
+        }
+        if (args.naive_kv_cross) {
+            throw std::runtime_error("--async-pipeline cannot be combined with --naive-kv-cross");
+        }
+    } else {
+        if (!args.prompt_file.empty()) {
+            throw std::runtime_error("--prompt-file requires --async-pipeline");
+        }
+        if (args.pipeline_microbatch != 0) {
+            throw std::runtime_error("--pipeline-microbatch requires --async-pipeline");
+        }
+    }
     if (args.stream_kv) {
         if (args.stream_kv_sink < 0 || args.stream_kv_recent < 0) {
             throw std::runtime_error("--stream-kv-sink and --stream-kv-recent must be non-negative");
@@ -2053,7 +2321,7 @@ static void validate_args(const pipeline_args & args) {
         if (args.model.empty()) {
             throw std::runtime_error("--model is required");
         }
-        if (args.prompt.empty()) {
+        if (!args.async_pipeline && args.prompt.empty()) {
             throw std::runtime_error("--prompt is required");
         }
         if (stage_mode && args.stage_numa.empty()) {
@@ -2103,8 +2371,9 @@ static void validate_args(const pipeline_args & args) {
         if (args.model.empty()) {
             throw std::runtime_error("--model is required");
         }
-        if ((!stage_mode && args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && args.prompt.empty()) ||
-                (stage_mode && args.stage_id == 0 && args.prompt.empty())) {
+        if (!args.async_pipeline &&
+                ((!stage_mode && args.role == LLAMA_PIPELINE_BRICK_ROLE_HEAD && args.prompt.empty()) ||
+                 (stage_mode && args.stage_id == 0 && args.prompt.empty()))) {
             throw std::runtime_error("--prompt is required on head");
         }
         if (args.n_predict <= 0) {
@@ -2148,6 +2417,13 @@ static llama_model * load_brick_model(const pipeline_args & args) {
     mparams.pipeline_brick_layer_end = args.layer_end;
     mparams.pipeline_brick_tp_rank = args.tp_rank;
     mparams.pipeline_brick_tp_size = args.tp_size;
+    mparams.pipeline_brick_kv_numa_node = tail_kv_numa_node(args);
+    if (mparams.pipeline_brick_kv_numa_node >= 0) {
+        fprintf(stderr,
+                "pipeline-brick KV NUMA: role=%s rank=%d/%d target_node=%d\n",
+                role_name(args.role).c_str(), args.tp_rank, args.tp_size,
+                mparams.pipeline_brick_kv_numa_node);
+    }
     if (args.tp_size > 1) {
         mparams.use_mmap = false; // load TP shards into rank-local memory after CPU binding
     }
@@ -2239,7 +2515,7 @@ static std::vector<uint8_t> make_hidden_payload(
         if (type == hidden_dtype::f32) {
             memcpy(data + (size_t) i * n_embd * sizeof(float), hidden, (size_t) n_embd * sizeof(float));
         } else {
-            ggml_fp32_to_bf16_row(hidden, reinterpret_cast<ggml_bf16_t *>(data) + (size_t) i * n_embd, n_embd);
+            ggml_fp32_to_fp16_row(hidden, reinterpret_cast<ggml_fp16_t *>(data) + (size_t) i * n_embd, n_embd);
         }
     }
 
@@ -2270,7 +2546,7 @@ static bool decode_hidden_payload(
     if (type == hidden_dtype::f32) {
         memcpy(hidden_f32.data(), data, hidden_f32.size() * sizeof(float));
     } else {
-        ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(data), hidden_f32.data(), (int64_t) hidden_f32.size());
+        ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(data), hidden_f32.data(), (int64_t) hidden_f32.size());
     }
 
     return true;
@@ -2304,7 +2580,7 @@ static llama_token read_token_for_seq(Transport & transport, int32_t seq_id, std
 }
 
 template<typename Transport>
-static int run_head(const pipeline_args & args, Transport & transport) {
+static int run_head_sync(const pipeline_args & args, Transport & transport) {
     llama_backend_init();
     bind_to_cpus(args.numa_cpus);
     init_ggml_numa_for_binding(args);
@@ -2358,6 +2634,7 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         llama_set_stream_kv_active(ctx, false);
     }
 
+    const pipeline_profile_snapshot prefill_start = capture_pipeline_profile();
     for (size_t offset = 0; offset < prompt_tokens.size(); offset += args.prefill_chunk) {
         const size_t chunk = std::min((size_t) args.prefill_chunk, prompt_tokens.size() - offset);
         batch.n_tokens = (int32_t) chunk * args.parallel;
@@ -2389,19 +2666,27 @@ static int run_head(const pipeline_args & args, Transport & transport) {
             return 3;
         }
 
-        uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
-        {
-            pipe_timer _t(g_pipe_prof.cxl_send_us);
-            g_pipe_prof.cxl_send_calls++;
-            transport.send_hidden_payload((int32_t) offset, batch.n_tokens, n_embd, flags, payload.data(), payload.size());
+        uint32_t flags = args.hidden_type == hidden_dtype::f16 ? PIPELINE_FLAG_HIDDEN_F16 : 0u;
+        send_hidden_payload_profiled(
+                args, transport, (int32_t) offset, batch.n_tokens, n_embd,
+                flags, payload.data(), payload.size());
+        // naive-transfer-mult: simulate naive pipeline that additionally transfers (mult-1) copies
+        // of activation-size data each send (mimics sending per-layer activations instead of just
+        // the boundary hidden state). Re-sends the same payload bytes to match data volume.
+        for (int32_t m = 1; m < args.naive_transfer_mult; ++m) {
+            send_hidden_payload_profiled(
+                    args, transport, (int32_t) offset, batch.n_tokens, n_embd,
+                    flags | PIPELINE_FLAG_TRAFFIC_ONLY, payload.data(), payload.size());
         }
         if (!args.quiet) {
-            fprintf(stderr, "pipeline-brick head: sent prefill pos=%zu n_tokens=%d bytes=%zu dtype=%s\n",
-                    offset, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type));
+            fprintf(stderr, "pipeline-brick head: sent prefill pos=%zu n_tokens=%d bytes=%zu dtype=%s naive_mult=%d\n",
+                    offset, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type), args.naive_transfer_mult);
         }
     }
 
     std::vector<token_payload> pending_tokens;
+    pipeline_profile_snapshot decode_start = {};
+    bool decode_phase_started = false;
     for (int32_t step = 1; step < args.n_predict; ++step) {
         const int32_t decode_pos = (int32_t) prompt_tokens.size() + step - 1;
         batch.n_tokens = args.parallel;
@@ -2421,6 +2706,11 @@ static int run_head(const pipeline_args & args, Transport & transport) {
             batch.token[seq_id] = token;
             set_batch_entry(batch, seq_id, seq_id, decode_pos, true);
             metas.push_back({ seq_id, decode_pos, PIPELINE_FLAG_WANT_LOGITS, 0u });
+        }
+
+        if (!decode_phase_started) {
+            decode_start = capture_pipeline_profile();
+            decode_phase_started = true;
         }
 
         if (args.stream_kv) {
@@ -2444,15 +2734,20 @@ static int run_head(const pipeline_args & args, Transport & transport) {
             return 3;
         }
 
-        uint32_t flags = args.hidden_type == hidden_dtype::bf16 ? PIPELINE_FLAG_HIDDEN_BF16 : 0u;
-        {
-            pipe_timer _t(g_pipe_prof.cxl_send_us);
-            g_pipe_prof.cxl_send_calls++;
-            transport.send_hidden_payload(decode_pos, batch.n_tokens, n_embd, flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE, payload.data(), payload.size());
+        uint32_t flags = args.hidden_type == hidden_dtype::f16 ? PIPELINE_FLAG_HIDDEN_F16 : 0u;
+        send_hidden_payload_profiled(
+                args, transport, decode_pos, batch.n_tokens, n_embd,
+                flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE,
+                payload.data(), payload.size());
+        for (int32_t m = 1; m < args.naive_transfer_mult; ++m) {
+            send_hidden_payload_profiled(
+                    args, transport, decode_pos, batch.n_tokens, n_embd,
+                    flags | PIPELINE_FLAG_DECODE | PIPELINE_FLAG_TRAFFIC_ONLY,
+                    payload.data(), payload.size());
         }
         if (!args.quiet) {
-            fprintf(stderr, "pipeline-brick head: sent decode pos=%d n_tokens=%d bytes=%zu dtype=%s\n",
-                    decode_pos, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type));
+            fprintf(stderr, "pipeline-brick head: sent decode pos=%d n_tokens=%d bytes=%zu dtype=%s naive_mult=%d\n",
+                    decode_pos, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type), args.naive_transfer_mult);
         }
     }
 
@@ -2466,8 +2761,18 @@ static int run_head(const pipeline_args & args, Transport & transport) {
         }
     }
 
-    const int64_t t_infer_end = ggml_time_us();
+    if (!decode_phase_started) {
+        decode_start = capture_pipeline_profile();
+        decode_phase_started = true;
+    }
+    const pipeline_profile_snapshot phase_end = capture_pipeline_profile();
+    const int64_t t_infer_end = phase_end.wall_us;
+    transport.send_stop(0, (int32_t) prompt_tokens.size() + args.n_predict - 1);
     const double infer_s = (t_infer_end - t_infer_start) / 1e6;
+    const double prefill_s = (decode_start.wall_us - prefill_start.wall_us) / 1e6;
+    const double decode_s = (phase_end.wall_us - decode_start.wall_us) / 1e6;
+    const int64_t n_decode_steps = args.n_predict - 1;
+    const int64_t n_decode_tokens = n_decode_steps * (int64_t) args.parallel;
     if (args.tp_size <= 1 || args.tp_rank == 0) {
         fprintf(stderr, "pipeline-brick perf: inference time %.2f s\n", infer_s);
         fprintf(stderr, "pipeline-brick perf: total prompt tokens %lld, speed %.2f t/s\n",
@@ -2478,19 +2783,299 @@ static int run_head(const pipeline_args & args, Transport & transport) {
                 (long long) n_gen_read, (long long) n_total_gen);
         fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
                 (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
+        fprintf(stderr,
+                "pipeline-brick phase: prefill time %.3f s, prompt tokens %lld, speed %.2f t/s, ttft %.2f ms\n",
+                prefill_s, (long long) n_total_prompt,
+                prefill_s > 0.0 ? n_total_prompt / prefill_s : 0.0,
+                prefill_s * 1000.0);
+        fprintf(stderr,
+                "pipeline-brick phase: decode time %.3f s, decode tokens %lld, speed %.2f t/s, steps %lld, tpot %.3f ms/step\n",
+                decode_s, (long long) n_decode_tokens,
+                decode_s > 0.0 ? n_decode_tokens / decode_s : 0.0,
+                (long long) n_decode_steps,
+                n_decode_steps > 0 ? decode_s * 1000.0 / n_decode_steps : 0.0);
     }
+    print_pipeline_phase_profile(args, "prefill", prefill_start, decode_start);
+    print_pipeline_phase_profile(args, "decode", decode_start, phase_end);
     print_pipeline_profile(args, infer_s);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
     }
-
-    transport.send_stop(0, (int32_t) prompt_tokens.size() + args.n_predict - 1);
 
     llama_batch_free(batch);
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
     return 0;
+}
+
+template<typename Transport>
+static int run_head_async(const pipeline_args & args, Transport & transport) {
+    llama_backend_init();
+    bind_to_cpus(args.numa_cpus);
+    init_ggml_numa_for_binding(args);
+
+    llama_model * model = load_brick_model(args);
+    if (!model) {
+        fprintf(stderr, "pipeline-brick head: failed to load model\n");
+        return 2;
+    }
+
+    llama_context * ctx = make_context(model, args, true);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int64_t t_infer_start = ggml_time_us();
+    std::vector<std::vector<llama_token>> prompt_tokens(args.parallel);
+    size_t max_prompt_tokens = 0;
+    int64_t n_total_prompt = 0;
+    for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
+        const std::string prompt =
+            std::string(PIPELINE_PARALLEL_SYSTEM_PROMPT) +
+            "User:\n" + args.async_prompts[seq_id] + "\nAssistant:\n";
+        prompt_tokens[seq_id] = common_tokenize(vocab, prompt, false);
+        if (prompt_tokens[seq_id].empty()) {
+            fprintf(stderr, "pipeline-brick head: empty prompt after tokenization for seq=%d\n", seq_id);
+            return 2;
+        }
+        if ((int64_t) prompt_tokens[seq_id].size() + args.n_predict > args.ctx_size) {
+            fprintf(stderr,
+                    "pipeline-brick head: seq=%d requires %zu prompt tokens + %d generated tokens, ctx_size=%d\n",
+                    seq_id, prompt_tokens[seq_id].size(), args.n_predict, args.ctx_size);
+            return 2;
+        }
+        max_prompt_tokens = std::max(max_prompt_tokens, prompt_tokens[seq_id].size());
+        n_total_prompt += (int64_t) prompt_tokens[seq_id].size();
+    }
+
+    const int32_t n_embd = llama_model_n_embd(model);
+    if (n_embd != effective_n_embd(args)) {
+        fprintf(stderr, "pipeline-brick head: expected n_embd=%d, got %d (use --n-embd to override)\n", effective_n_embd(args), n_embd);
+        return 2;
+    }
+
+    const int32_t n_groups =
+        (args.parallel + args.pipeline_microbatch - 1) / args.pipeline_microbatch;
+    fprintf(stderr,
+            "pipeline-brick head: brick=%d peer=%d layers [%d,%d), parallel=%d, n_embd=%d, numa_tp=%d\n",
+            args.brick_id, args.peer_brick_id, args.layer_start, args.layer_end, args.parallel, n_embd, args.numa_tp);
+    fprintf(stderr,
+            "pipeline-brick head: async-pipeline decode-only prompts=%d microbatch=%d groups=%d prompt_file=%s\n",
+            args.parallel, args.pipeline_microbatch, n_groups, args.prompt_file.c_str());
+    fprintf(stderr,
+            "pipeline-brick head: micro-batch max=%d prefill_chunk=%d hidden_dtype=%s bytes_per_token=%zu\n",
+            max_micro_batch_tokens(args), args.prefill_chunk, hidden_dtype_name(args.hidden_type),
+            (size_t) n_embd * hidden_dtype_size(args.hidden_type));
+    for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
+        fprintf(stderr, "pipeline-brick head: async prompt seq=%d tokens=%zu\n",
+                seq_id, prompt_tokens[seq_id].size());
+    }
+
+    llama_batch batch = llama_batch_init(max_micro_batch_tokens(args), 0, 1);
+    const int64_t n_total_gen = (int64_t) args.n_predict * args.parallel;
+    int64_t n_gen_read = 0;
+    int64_t decode_dispatches = 0;
+
+    const pipeline_profile_snapshot prefill_start = capture_pipeline_profile();
+    for (size_t offset = 0; offset < max_prompt_tokens; offset += args.prefill_chunk) {
+        const size_t end = std::min(offset + (size_t) args.prefill_chunk, max_prompt_tokens);
+        batch.n_tokens = 0;
+        std::vector<hidden_token_meta> metas;
+        metas.reserve((end - offset) * (size_t) args.parallel);
+
+        for (size_t pos = offset; pos < end; ++pos) {
+            for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
+                if (pos >= prompt_tokens[seq_id].size()) {
+                    continue;
+                }
+                const int32_t bi = batch.n_tokens++;
+                const bool want_logits = pos + 1 == prompt_tokens[seq_id].size();
+                batch.token[bi] = prompt_tokens[seq_id][pos];
+                set_batch_entry(batch, bi, seq_id, (int32_t) pos, true);
+                metas.push_back({ seq_id, (int32_t) pos, want_logits ? PIPELINE_FLAG_WANT_LOGITS : 0u, 0u });
+            }
+        }
+
+        if (batch.n_tokens == 0) {
+            continue;
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "pipeline-brick head: llama_decode failed at async prompt offset=%zu n_tokens=%d\n",
+                    offset, batch.n_tokens);
+            return 3;
+        }
+
+        std::vector<uint8_t> payload;
+        try {
+            payload = make_hidden_payload(ctx, metas, n_embd, args.hidden_type);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "pipeline-brick head: %s\n", e.what());
+            return 3;
+        }
+
+        uint32_t flags = args.hidden_type == hidden_dtype::f16 ? PIPELINE_FLAG_HIDDEN_F16 : 0u;
+        send_hidden_payload_profiled(
+                args, transport, (int32_t) offset, batch.n_tokens, n_embd,
+                flags, payload.data(), payload.size());
+        for (int32_t m = 1; m < args.naive_transfer_mult; ++m) {
+            send_hidden_payload_profiled(
+                    args, transport, (int32_t) offset, batch.n_tokens, n_embd,
+                    flags | PIPELINE_FLAG_TRAFFIC_ONLY, payload.data(), payload.size());
+        }
+        if (!args.quiet) {
+            fprintf(stderr,
+                    "pipeline-brick head: sent async prefill pos=%zu n_tokens=%d bytes=%zu dtype=%s naive_mult=%d\n",
+                    offset, batch.n_tokens, payload.size(), hidden_dtype_name(args.hidden_type),
+                    args.naive_transfer_mult);
+        }
+    }
+
+    std::vector<token_payload> pending_tokens;
+    std::vector<llama_token> current_tokens(args.parallel);
+    for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
+        try {
+            current_tokens[seq_id] = read_token_for_seq(transport, seq_id, pending_tokens);
+            ++n_gen_read;
+        } catch (const std::exception & e) {
+            fprintf(stderr, "pipeline-brick head: %s\n", e.what());
+            return 3;
+        }
+    }
+    const pipeline_profile_snapshot decode_start = capture_pipeline_profile();
+
+    auto dispatch_group = [&](int32_t group_id, int32_t step) -> bool {
+        const int32_t seq_begin = group_id * args.pipeline_microbatch;
+        const int32_t seq_end = std::min(seq_begin + args.pipeline_microbatch, args.parallel);
+        batch.n_tokens = seq_end - seq_begin;
+        std::vector<hidden_token_meta> metas;
+        metas.reserve(batch.n_tokens);
+
+        for (int32_t seq_id = seq_begin; seq_id < seq_end; ++seq_id) {
+            const int32_t bi = seq_id - seq_begin;
+            const int32_t decode_pos = (int32_t) prompt_tokens[seq_id].size() + step - 1;
+            batch.token[bi] = current_tokens[seq_id];
+            set_batch_entry(batch, bi, seq_id, decode_pos, true);
+            metas.push_back({ seq_id, decode_pos, PIPELINE_FLAG_WANT_LOGITS, 0u });
+        }
+
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr,
+                    "pipeline-brick head: llama_decode failed at async generated step=%d group=%d n_tokens=%d\n",
+                    step, group_id, batch.n_tokens);
+            return false;
+        }
+
+        std::vector<uint8_t> payload;
+        try {
+            payload = make_hidden_payload(ctx, metas, n_embd, args.hidden_type);
+        } catch (const std::exception & e) {
+            fprintf(stderr, "pipeline-brick head: %s\n", e.what());
+            return false;
+        }
+
+        const int32_t header_pos = metas.front().pos;
+        uint32_t flags = args.hidden_type == hidden_dtype::f16 ? PIPELINE_FLAG_HIDDEN_F16 : 0u;
+        send_hidden_payload_profiled(
+                args, transport, header_pos, batch.n_tokens, n_embd,
+                flags | PIPELINE_FLAG_WANT_LOGITS | PIPELINE_FLAG_DECODE,
+                payload.data(), payload.size());
+        for (int32_t m = 1; m < args.naive_transfer_mult; ++m) {
+            send_hidden_payload_profiled(
+                    args, transport, header_pos, batch.n_tokens, n_embd,
+                    flags | PIPELINE_FLAG_DECODE | PIPELINE_FLAG_TRAFFIC_ONLY,
+                    payload.data(), payload.size());
+        }
+        ++decode_dispatches;
+        if (!args.quiet) {
+            fprintf(stderr,
+                    "pipeline-brick head: sent async decode step=%d group=%d seq=[%d,%d) pos=%d n_tokens=%d bytes=%zu\n",
+                    step, group_id, seq_begin, seq_end, header_pos, batch.n_tokens, payload.size());
+        }
+        return true;
+    };
+
+    auto receive_group = [&](int32_t group_id) -> bool {
+        const int32_t seq_begin = group_id * args.pipeline_microbatch;
+        const int32_t seq_end = std::min(seq_begin + args.pipeline_microbatch, args.parallel);
+        for (int32_t seq_id = seq_begin; seq_id < seq_end; ++seq_id) {
+            try {
+                current_tokens[seq_id] = read_token_for_seq(transport, seq_id, pending_tokens);
+                ++n_gen_read;
+            } catch (const std::exception & e) {
+                fprintf(stderr, "pipeline-brick head: %s\n", e.what());
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (args.n_predict > 1) {
+        for (int32_t group_id = 0; group_id < n_groups; ++group_id) {
+            if (!dispatch_group(group_id, 1)) {
+                return 3;
+            }
+        }
+
+        for (int32_t step = 2; step < args.n_predict; ++step) {
+            for (int32_t group_id = 0; group_id < n_groups; ++group_id) {
+                if (!receive_group(group_id) || !dispatch_group(group_id, step)) {
+                    return 3;
+                }
+            }
+        }
+
+        for (int32_t group_id = 0; group_id < n_groups; ++group_id) {
+            if (!receive_group(group_id)) {
+                return 3;
+            }
+        }
+    }
+
+    const pipeline_profile_snapshot phase_end = capture_pipeline_profile();
+    const int64_t t_infer_end = phase_end.wall_us;
+    transport.send_stop(0, (int32_t) max_prompt_tokens + args.n_predict - 1);
+    const double infer_s = (t_infer_end - t_infer_start) / 1e6;
+    const double prefill_s = (decode_start.wall_us - prefill_start.wall_us) / 1e6;
+    const double decode_s = (phase_end.wall_us - decode_start.wall_us) / 1e6;
+    const int64_t n_decode_steps = args.n_predict - 1;
+    const int64_t n_decode_tokens = n_decode_steps * (int64_t) args.parallel;
+    if (args.tp_size <= 1 || args.tp_rank == 0) {
+        fprintf(stderr,
+                "pipeline-brick async: decode-only prompts=%d microbatch=%d groups=%d decode_dispatches=%lld\n",
+                args.parallel, args.pipeline_microbatch, n_groups, (long long) decode_dispatches);
+        fprintf(stderr, "pipeline-brick perf: inference time %.2f s\n", infer_s);
+        fprintf(stderr, "pipeline-brick perf: total prompt tokens %lld, speed %.2f t/s\n",
+                (long long) n_total_prompt, n_total_prompt / infer_s);
+        fprintf(stderr, "pipeline-brick perf: total gen tokens %lld, speed %.2f t/s\n",
+                (long long) n_total_gen, n_total_gen / infer_s);
+        fprintf(stderr, "pipeline-brick perf: measured gen tokens %lld / target %lld\n",
+                (long long) n_gen_read, (long long) n_total_gen);
+        fprintf(stderr, "pipeline-brick perf: total tokens %lld, speed %.2f t/s\n",
+                (long long) (n_total_prompt + n_total_gen), (n_total_prompt + n_total_gen) / infer_s);
+        fprintf(stderr,
+                "pipeline-brick phase: prefill time %.3f s, prompt tokens %lld, speed %.2f t/s, ttft %.2f ms\n",
+                prefill_s, (long long) n_total_prompt,
+                prefill_s > 0.0 ? n_total_prompt / prefill_s : 0.0,
+                prefill_s * 1000.0);
+        fprintf(stderr,
+                "pipeline-brick phase: decode time %.3f s, decode tokens %lld, speed %.2f t/s, steps %lld, tpot %.3f ms/step\n",
+                decode_s, (long long) n_decode_tokens,
+                decode_s > 0.0 ? n_decode_tokens / decode_s : 0.0,
+                (long long) n_decode_steps,
+                n_decode_steps > 0 ? decode_s * 1000.0 / n_decode_steps : 0.0);
+    }
+    print_pipeline_phase_profile(args, "prefill", prefill_start, decode_start);
+    print_pipeline_phase_profile(args, "decode", decode_start, phase_end);
+    print_pipeline_profile(args, infer_s);
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_backend_free();
+    return 0;
+}
+
+template<typename Transport>
+static int run_head(const pipeline_args & args, Transport & transport) {
+    return args.async_pipeline ? run_head_async(args, transport) : run_head_sync(args, transport);
 }
 
 template<typename Transport>
@@ -2535,29 +3120,67 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         llama_set_stream_kv_active(ctx, false);
     }
 
+    // naive-kv-cross: pre-allocate a peer-pinned buffer sized for the worst-case
+    // KV cache of this brick (all layers, full ctx). Read each decode step to
+    // simulate a naive scenario where this brick's KV cache is on the peer CPU.
+    uint64_t naive_kv_width = 0;
+    if (args.naive_kv_cross) {
+        const int64_t n_kv_layers = (int64_t) args.layer_end - args.layer_start;
+        for (int32_t il = args.layer_start; il < args.layer_end; ++il) {
+            const int32_t n_k = llama_model_n_embd_k_gqa(model, il);
+            const int32_t n_v = llama_model_n_embd_v_gqa(model, il);
+            if (n_k <= 0 || n_v <= 0 || n_k % args.tp_size != 0 || n_v % args.tp_size != 0) {
+                fprintf(stderr,
+                        "pipeline-brick tail: invalid TP-local KV geometry at layer %d: k=%d v=%d tp_size=%d\n",
+                        il, n_k, n_v, args.tp_size);
+                return 2;
+            }
+            naive_kv_width += (uint64_t) (n_k + n_v) / (uint64_t) args.tp_size;
+        }
+        const int32_t n_kv_embd = llama_model_n_embd_k_gqa(model, args.layer_start) / args.tp_size;
+        const size_t elem_size = 2; // F16
+        const size_t max_kv_bytes = (size_t) naive_kv_width
+                * (size_t) args.ctx_size * (size_t) args.parallel * elem_size;
+        const int kv_node = args.naive_kv_cross_node >= 0 ? args.naive_kv_cross_node : 0;
+        fprintf(stderr,
+                "pipeline-brick tail: naive-kv-cross enabled kv_layers=%lld kv_k_embd/rank=%d ctx=%d parallel=%d node=%d max_kv=%.1f MiB\n",
+                (long long) n_kv_layers, n_kv_embd, args.ctx_size, args.parallel,
+                kv_node, (double) max_kv_bytes / (1024.0 * 1024.0));
+        init_naive_kv_buf(kv_node, max_kv_bytes);
+        if (!g_naive_kv_buf) {
+            fprintf(stderr, "pipeline-brick tail: naive-kv-cross buffer allocation failed\n");
+            return 2;
+        }
+    }
+
     const int64_t t_infer_start = ggml_time_us();
     int64_t first_recv_us = 0;
+    int64_t final_stop_recv_us = 0;
     bool first_packet = true;
     while (true) {
         int64_t rw0 = ggml_time_us();
         recv_packet packet = transport.recv();
         const int64_t waited = ggml_time_us() - rw0;
-        // First recv blocks while head loads model + runs first prefill; that is
-        // head startup latency, not a pipeline bubble, so exclude it from wait_recv
-        // and from the infer total (subtracted below).
-        if (!first_packet) {
+        const brick_packet_header & header = packet.header;
+        // Exclude the first packet's startup wait and the final STOP wait from
+        // pipeline-bubble accounting.
+        if (first_packet) {
+            first_recv_us = waited;
+        } else if (header.flags & PIPELINE_FLAG_STOP) {
+            final_stop_recv_us = waited;
+        } else {
             g_pipe_prof.wait_recv_us += waited;
             g_pipe_prof.wait_recv_calls++;
-        } else {
-            first_recv_us = waited;
         }
         first_packet = false;
-        const brick_packet_header & header = packet.header;
         if (header.flags & PIPELINE_FLAG_STOP) {
             break;
         }
-        const bool packet_bf16 = (header.flags & PIPELINE_FLAG_HIDDEN_BF16) != 0;
-        if (packet_bf16 != (args.hidden_type == hidden_dtype::bf16)) {
+        if (header.flags & PIPELINE_FLAG_TRAFFIC_ONLY) {
+            continue;
+        }
+        const bool packet_f16 = (header.flags & PIPELINE_FLAG_HIDDEN_F16) != 0;
+        if (packet_f16 != (args.hidden_type == hidden_dtype::f16)) {
             fprintf(stderr, "pipeline-brick tail: hidden dtype mismatch\n");
             return 3;
         }
@@ -2599,6 +3222,12 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
             }
         }
 
+        // naive-kv-cross: simulate reading this brick's KV cache from the peer CPU
+        // before attention. KV size grows with sequence length (header.pos+1).
+        if (args.naive_kv_cross && g_naive_kv_buf && (header.flags & PIPELINE_FLAG_DECODE)) {
+            simulate_kv_cxl_read(naive_kv_width, header.pos + 1, header.n_tokens);
+        }
+
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "pipeline-brick tail: llama_decode failed at pos=%d n_tokens=%d\n", header.pos, batch.n_tokens);
             return 3;
@@ -2616,6 +3245,9 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         }
     }
 
+    const int64_t t_infer_end = ggml_time_us();
+    const double infer_s =
+        (t_infer_end - t_infer_start - first_recv_us - final_stop_recv_us) / 1e6;
     if (args.tp_size <= 1 || args.tp_rank == 0) {
         for (int32_t seq_id = 0; seq_id < args.parallel; ++seq_id) {
             printf("[seq %d] %s\n", seq_id, outputs[seq_id].c_str());
@@ -2624,11 +3256,14 @@ static int run_tail(const pipeline_args & args, Transport & transport) {
         fprintf(stderr, "pipeline-brick tail: measured sent gen tokens %lld / target %lld\n",
                 (long long) n_gen_sent, (long long) n_target_gen);
     }
-    const int64_t t_infer_end = ggml_time_us();
-    const double infer_s = (t_infer_end - t_infer_start - first_recv_us) / 1e6;
     print_pipeline_profile(args, infer_s);
     if (args.stream_kv) {
         llama_set_stream_kv_active(ctx, false);
+    }
+    if (g_naive_kv_buf) {
+        munmap(g_naive_kv_buf, g_naive_kv_buf_size);
+        g_naive_kv_buf = nullptr;
+        g_naive_kv_buf_size = 0;
     }
 
     llama_batch_free(batch);
@@ -2680,9 +3315,15 @@ static int run_middle_stage(const pipeline_args & args, Upstream & upstream, Dow
             downstream.send_stop(header.seq_id, header.pos);
             break;
         }
+        if (header.flags & PIPELINE_FLAG_TRAFFIC_ONLY) {
+            downstream.send_hidden_payload(
+                    header.pos, header.n_tokens, header.n_embd, header.flags,
+                    packet.payload.data(), packet.payload.size());
+            continue;
+        }
 
-        const bool packet_bf16 = (header.flags & PIPELINE_FLAG_HIDDEN_BF16) != 0;
-        if (packet_bf16 != (args.hidden_type == hidden_dtype::bf16)) {
+        const bool packet_f16 = (header.flags & PIPELINE_FLAG_HIDDEN_F16) != 0;
+        if (packet_f16 != (args.hidden_type == hidden_dtype::f16)) {
             fprintf(stderr, "pipeline-brick stage%d: hidden dtype mismatch\n", args.stage_id);
             return 3;
         }
@@ -2954,6 +3595,14 @@ static std::string tp_rank_numa_node(const pipeline_args & args, int tp_rank) {
     return std::to_string(nodes[tp_rank]);
 }
 
+static int tp_rank_primary_numa_node(const pipeline_args & args, int tp_rank) {
+    const std::vector<int> nodes = parse_cpu_list_ordered(tp_rank_numa_node(args, tp_rank));
+    if (nodes.empty()) {
+        throw std::runtime_error("TP rank NUMA node list is empty");
+    }
+    return nodes.front();
+}
+
 static size_t tp_broadcast_size(const pipeline_args & args) {
     return align_up(sizeof(tp_broadcast_shm), 64) + max_hidden_payload_bytes(args) + 4096;
 }
@@ -2970,16 +3619,17 @@ static int run_hardware_tp(const pipeline_args & args) {
     const size_t shm_size = align_up(bc_size, 64) + ar_size;
     const size_t max_payload_bytes = max_hidden_payload_bytes(args);
 
-    void * shm = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shm == MAP_FAILED) {
-        throw std::runtime_error("TP shared mmap failed: " + std::string(strerror(errno)));
+    const int shm_node = tp_rank_primary_numa_node(args, 0);
+    void * shm = alloc_on_node(shm_size, shm_node);
+    if (!shm) {
+        throw std::runtime_error("TP shared allocation failed on NUMA node " + std::to_string(shm_node));
     }
 
     auto * bc_shm = (tp_broadcast_shm *) shm;
     void * ar_shm = (uint8_t *) shm + align_up(bc_size, 64);
 
-    fprintf(stderr, "pipeline-brick TP: role=%s tp_size=%d broadcast=%zu all_reduce=%zu\n",
-            role_name(args.role).c_str(), tp_size, bc_size, ar_size);
+    fprintf(stderr, "pipeline-brick TP: role=%s tp_size=%d shm_node=%d broadcast=%zu all_reduce=%zu\n",
+            role_name(args.role).c_str(), tp_size, shm_node, bc_size, ar_size);
 
     std::vector<pid_t> children;
     for (int r = 0; r < tp_size; ++r) {
@@ -3103,9 +3753,11 @@ static int run_hardware_stage_tp(const pipeline_args & raw_args) {
     const size_t shm_size = ar_offset + ar_size;
     const size_t max_payload_bytes = max_hidden_payload_bytes(args);
 
-    void * shm = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (shm == MAP_FAILED) {
-        throw std::runtime_error("stage TP shared mmap failed: " + std::string(strerror(errno)));
+    const int shm_node = tp_rank_primary_numa_node(args, 0);
+    void * shm = alloc_on_node(shm_size, shm_node);
+    if (!shm) {
+        throw std::runtime_error(
+                "stage TP shared allocation failed on NUMA node " + std::to_string(shm_node));
     }
 
     auto * up_bc_shm = (tp_broadcast_shm *) ((uint8_t *) shm + up_bc_offset);
@@ -3113,9 +3765,9 @@ static int run_hardware_stage_tp(const pipeline_args & raw_args) {
     void * ar_shm = (uint8_t *) shm + ar_offset;
 
     fprintf(stderr,
-            "pipeline-brick stage%d TP: layers [%d,%d) role=%s tp_size=%d broadcast=%zu all_reduce=%zu\n",
+            "pipeline-brick stage%d TP: layers [%d,%d) role=%s tp_size=%d shm_node=%d broadcast=%zu all_reduce=%zu\n",
             args.stage_id, args.layer_start, args.layer_end, role_name(args.role).c_str(),
-            tp_size, bc_size, ar_size);
+            tp_size, shm_node, bc_size, ar_size);
 
     std::vector<pid_t> children;
     for (int r = 0; r < tp_size; ++r) {
@@ -3396,8 +4048,18 @@ static int run_single_system(const pipeline_args & args) {
     create_shared_window_file(h2t_path, window_size);
     create_shared_window_file(t2h_path, window_size);
     if (args.transport == transport_kind::cxl) {
-        bind_shared_window_to_numa(h2t_path, window_size, args.tail_numa, "head-to-tail");
-        bind_shared_window_to_numa(t2h_path, window_size, args.head_numa, "tail-to-head");
+        std::string head_window_numa = args.head_numa;
+        std::string tail_window_numa = args.tail_numa;
+        if (args.tp_size > 1) {
+            pipeline_args head_bind_args = args;
+            pipeline_args tail_bind_args = args;
+            head_bind_args.role = LLAMA_PIPELINE_BRICK_ROLE_HEAD;
+            tail_bind_args.role = LLAMA_PIPELINE_BRICK_ROLE_TAIL;
+            head_window_numa = tp_rank_numa_node(head_bind_args, 0);
+            tail_window_numa = tp_rank_numa_node(tail_bind_args, 0);
+        }
+        bind_shared_window_to_numa(h2t_path, window_size, tail_window_numa, "head-to-tail");
+        bind_shared_window_to_numa(t2h_path, window_size, head_window_numa, "tail-to-head");
     }
 
     fprintf(stderr,
@@ -3452,6 +4114,7 @@ int main(int argc, char ** argv) {
     try {
         pipeline_args args = parse_args(argc, argv);
         apply_domain_mode_defaults(args);
+        prepare_async_prompts(args);
         validate_args(args);
         llama_log_set(pipeline_brick_log_callback, &args.verbose);
 

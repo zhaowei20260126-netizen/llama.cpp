@@ -5,13 +5,57 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
 #include <stdexcept>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+llama_kv_cache::numa_buffer_mapping::numa_buffer_mapping(void * addr, size_t size) :
+        addr(addr), size(size) {
+}
+
+llama_kv_cache::numa_buffer_mapping::~numa_buffer_mapping() {
+#if defined(__linux__)
+    if (addr != nullptr) {
+        munmap(addr, size);
+    }
+#endif
+}
+
+llama_kv_cache::numa_buffer_mapping::numa_buffer_mapping(numa_buffer_mapping && other) noexcept :
+        addr(other.addr), size(other.size) {
+    other.addr = nullptr;
+    other.size = 0;
+}
+
+llama_kv_cache::numa_buffer_mapping & llama_kv_cache::numa_buffer_mapping::operator=(numa_buffer_mapping && other) noexcept {
+    if (this != &other) {
+#if defined(__linux__)
+        if (addr != nullptr) {
+            munmap(addr, size);
+        }
+#endif
+        addr = other.addr;
+        size = other.size;
+        other.addr = nullptr;
+        other.size = 0;
+    }
+    return *this;
+}
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -115,6 +159,46 @@ static uint32_t llama_kv_cache_n_embd_v_gqa_max(const llama_model & model, const
 
     return val;
 }
+
+#if defined(__linux__)
+static void verify_numa_buffer_pages(void * base, size_t size, int node) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || size == 0) {
+        throw std::runtime_error("failed to determine page size for KV NUMA verification");
+    }
+
+    const size_t n_pages = (size + (size_t) page_size - 1) / (size_t) page_size;
+    const size_t n_samples = std::min<size_t>(16, n_pages);
+    std::vector<void *> pages;
+    pages.reserve(n_samples);
+    for (size_t i = 0; i < n_samples; ++i) {
+        const size_t page = n_samples == 1 ? 0 : i * (n_pages - 1) / (n_samples - 1);
+        pages.push_back((uint8_t *) base + page * (size_t) page_size);
+    }
+
+    std::vector<int> status(n_samples, -1);
+    const long rc = syscall(SYS_move_pages, 0, n_samples, pages.data(), nullptr, status.data(), 0);
+    if (rc != 0) {
+        LLAMA_LOG_WARN("%s: move_pages query unavailable for node %d: %s\n",
+                __func__, node, strerror(errno));
+        return;
+    }
+
+    for (int actual_node : status) {
+        if (actual_node < 0) {
+            throw std::runtime_error("move_pages failed for a sampled KV page: " +
+                    std::string(strerror(-actual_node)));
+        }
+        if (actual_node != node) {
+            throw std::runtime_error("KV NUMA verification expected node " +
+                    std::to_string(node) + ", sampled node " + std::to_string(actual_node));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: node = %d, verified pages = %zu/%zu\n",
+            __func__, node, status.size(), status.size());
+}
+#endif
 
 //
 // llama_kv_cache
@@ -328,25 +412,108 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    const int kv_numa_node = model.pipeline_brick_kv_numa_node();
+
+    auto alloc_ctx_tensors_on_numa = [&](ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+        ggml_backend_buffer_ptr result;
+
+#if defined(__linux__)
+        if (kv_numa_node < 0) {
+            return result;
+        }
+        if (buft != ggml_backend_cpu_buffer_type()) {
+            throw std::runtime_error("pipeline-brick KV NUMA placement requires a CPU KV buffer");
+        }
+
+        const size_t size = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, buft);
+        if (size == 0) {
+            throw std::runtime_error("cannot NUMA-bind an empty KV buffer");
+        }
+
+        void * base = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) {
+            throw std::runtime_error("mmap failed for KV NUMA buffer: " + std::string(strerror(errno)));
+        }
+        numa_buffer_mapping mapping(base, size);
+
+        const int bits_per_word = (int) (sizeof(unsigned long) * 8);
+        std::vector<unsigned long> mask((kv_numa_node / bits_per_word) + 1, 0);
+        mask[kv_numa_node / bits_per_word] |= 1UL << (kv_numa_node % bits_per_word);
+        const unsigned long maxnode = (unsigned long) mask.size() * bits_per_word;
+        if (syscall(SYS_mbind, base, size, MPOL_BIND, mask.data(), maxnode, 0) != 0) {
+            throw std::runtime_error("mbind failed for KV NUMA node " +
+                    std::to_string(kv_numa_node) + ": " + strerror(errno));
+        }
+
+        result.reset(ggml_backend_cpu_buffer_from_ptr(base, size));
+        if (!result) {
+            throw std::runtime_error("failed to create GGML buffer for NUMA-bound KV cache");
+        }
+
+        ggml_tallocr tallocr = ggml_tallocr_new(result.get());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            enum ggml_status status = GGML_STATUS_SUCCESS;
+            if (t->data == nullptr) {
+                if (t->view_src == nullptr) {
+                    status = ggml_tallocr_alloc(&tallocr, t);
+                } else if (t->buffer == nullptr) {
+                    status = ggml_backend_view_init(t);
+                }
+            } else if (t->view_src != nullptr && t->buffer == nullptr) {
+                status = ggml_backend_view_init(t);
+            }
+            if (status != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("failed to allocate tensor " +
+                        std::string(t->name) + " in NUMA-bound KV buffer");
+            }
+        }
+
+        numa_buffer_mappings.emplace_back(std::move(mapping));
+        return result;
+#else
+        GGML_UNUSED(ctx);
+        GGML_UNUSED(buft);
+        if (kv_numa_node >= 0) {
+            throw std::runtime_error("pipeline-brick KV NUMA placement requires Linux");
+        }
+        return result;
+#endif
+    };
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
+        ggml_backend_buffer_ptr buf;
         if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+            if (kv_numa_node >= 0) {
+                throw std::runtime_error("pipeline-brick KV NUMA placement requires real tensor allocation");
             }
+            buf.reset(ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0)); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf.get(); // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+            }
+        } else if (kv_numa_node >= 0) {
+            buf = alloc_ctx_tensors_on_numa(ctx.get(), buft);
         } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+            buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft)); // real buffer
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf.get()), ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
 
-        ggml_backend_buffer_clear(buf, 0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+        ggml_backend_buffer_clear(buf.get(), 0);
+#if defined(__linux__)
+        if (kv_numa_node >= 0) {
+            void * base = ggml_backend_buffer_get_base(buf.get());
+            const size_t size = ggml_backend_buffer_get_size(buf.get());
+            verify_numa_buffer_pages(base, size, kv_numa_node);
+            LLAMA_LOG_INFO("%s: pipeline-brick KV NUMA node = %d, base = %p, size = %.2f MiB\n",
+                    __func__, kv_numa_node, base, size/1024.0/1024.0);
+        }
+#endif
+        ctxs_bufs.emplace_back(std::move(ctx), std::move(buf));
     }
 
     {

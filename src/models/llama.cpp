@@ -57,8 +57,11 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
             if (tp_size != 2 && tp_size != 4) {
                 throw std::runtime_error("pipeline-brick TP prototype requires --tp-size 2 or 4");
             }
-            if ((n_embd_head_k * n_head) % tp_size != 0 ||
-                    n_embd_k_gqa % tp_size != 0 ||
+            if (n_expert > 0) {
+                throw std::runtime_error("pipeline-brick TP for Llama MoE is not implemented");
+            }
+            if (n_head % tp_size != 0 ||
+                    n_head_kv % tp_size != 0 ||
                     n_ff % tp_size != 0) {
                 throw std::runtime_error("llama dimensions are not divisible by pipeline-brick TP size");
             }
@@ -124,9 +127,9 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,      n_ff_local}, layer_flags);
 
             // optional MLP bias
-            layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+            layer.ffn_gate_b = create_tensor(tn(LLM_TENSOR_FFN_GATE, "bias", i), {n_ff_local}, TENSOR_NOT_REQUIRED);
             layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i), {n_embd}, TENSOR_NOT_REQUIRED);
-            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff}, TENSOR_NOT_REQUIRED);
+            layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i), {n_ff_local}, TENSOR_NOT_REQUIRED);
         } else {
             layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff, n_expert}, TENSOR_NOT_REQUIRED);
@@ -157,12 +160,25 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const bool pipeline_brick = model.pipeline_brick_enabled();
     const int layer_start = pipeline_brick ? model.pipeline_brick_layer_start() : 0;
     const int layer_end   = pipeline_brick ? model.pipeline_brick_layer_end()   : n_layer;
+    const bool pipeline_first = pipeline_brick && layer_start == 0;
     const bool pipeline_last  = pipeline_brick && layer_end == n_layer;
+    const int32_t tp_size = model.pipeline_brick_tp_size();
+    const bool tp_enabled = tp_size > 1;
+    const int64_t n_head_local    = tp_enabled ? model.pipeline_brick_tp_q_heads()  : n_head;
+    const int64_t n_head_kv_local = tp_enabled ? model.pipeline_brick_tp_kv_heads() : n_head_kv;
+
+    GGML_ASSERT(!tp_enabled || n_head_local > 0);
+    GGML_ASSERT(!tp_enabled || n_head_kv_local > 0);
+    GGML_ASSERT(!tp_enabled || n_head_local % n_head_kv_local == 0);
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
-    inpL = build_inp_embd(model.tok_embd);
+    if (!pipeline_brick || pipeline_first) {
+        inpL = build_inp_embd(model.tok_embd);
+    } else {
+        inpL = build_inp_hidden();
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -196,7 +212,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
             // compute Q and K and RoPE them
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
-                    n_embd_head, n_head, n_head_kv, il);
+                    n_embd_head, n_head_local, n_head_kv_local, il);
 
             Qcur = ggml_rope_ext(
                     ctx0, Qcur, inp_pos, rope_factors,
@@ -222,11 +238,18 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 cb(Kcur, "Kcur_normed", il);
             }
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    model.layers[il].wo, tp_enabled ? nullptr : model.layers[il].wo_b, model.layers[il].wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+            if (tp_enabled) {
+                cur = ggml_all_reduce_sum(ctx0, cur);
+                cb(cur, "attn_tp_all_reduce", il);
+                if (model.layers[il].wo_b) {
+                    cur = ggml_add(ctx0, cur, model.layers[il].wo_b);
+                }
+            }
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == layer_end - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -244,9 +267,16 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             cur = build_ffn(cur,
                     model.layers[il].ffn_up,   model.layers[il].ffn_up_b,   model.layers[il].ffn_up_s,
                     model.layers[il].ffn_gate, model.layers[il].ffn_gate_b, model.layers[il].ffn_gate_s,
-                    model.layers[il].ffn_down, model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
+                    model.layers[il].ffn_down, tp_enabled ? nullptr : model.layers[il].ffn_down_b, model.layers[il].ffn_down_s,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
+            if (tp_enabled) {
+                cur = ggml_all_reduce_sum(ctx0, cur);
+                cb(cur, "ffn_tp_all_reduce", il);
+                if (model.layers[il].ffn_down_b) {
+                    cur = ggml_add(ctx0, cur, model.layers[il].ffn_down_b);
+                }
+            }
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch

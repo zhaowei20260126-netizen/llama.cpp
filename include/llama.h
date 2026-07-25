@@ -329,6 +329,7 @@ extern "C" {
         int32_t pipeline_brick_layer_end;
         int32_t pipeline_brick_tp_rank;
         int32_t pipeline_brick_tp_size;
+        int32_t pipeline_brick_kv_numa_node;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
@@ -604,6 +605,8 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_k_gqa(const struct llama_model * model, int32_t il);
+    LLAMA_API int32_t llama_model_n_embd_v_gqa(const struct llama_model * model, int32_t il);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
